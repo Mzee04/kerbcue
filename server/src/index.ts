@@ -13,8 +13,16 @@ if (groupId && !/^-[1-9]\d*$/.test(groupId)) {
   throw new Error('TELEGRAM_GROUP_CHAT_ID must be a negative integer.')
 }
 
+const dispatcherSetting = process.env.TELEGRAM_DISPATCHER_IDS?.trim()
+const dispatcherIds = dispatcherSetting
+  ? new Set(dispatcherSetting.split(',').map(id => id.trim()))
+  : undefined
+if (dispatcherIds && [...dispatcherIds].some(id => !/^[1-9]\d*$/.test(id) || !Number.isSafeInteger(Number(id)))) {
+  throw new Error('TELEGRAM_DISPATCHER_IDS must be a comma-separated list of positive integer Telegram user IDs.')
+}
+
 const telegram = token ? new TelegramClient(token) : undefined
-const jobs = new JobStore()
+const jobs = new JobStore(process.env.KERBCUE_DATA_FILE?.trim() || undefined)
 const demo = !telegram && process.env.NODE_ENV !== 'production'
 const api = createApi({
   jobs,
@@ -56,7 +64,7 @@ server.listen(port, '0.0.0.0', () => {
   console.log(`Kerbcue API listening on port ${port}.`)
   if (telegram) {
     console.log(groupId ? 'Telegram polling enabled.' : 'Telegram polling for group chat ID discovery.')
-    void pollTelegram(telegram, jobs, groupId, stop.signal)
+    void pollTelegram(telegram, jobs, groupId, stop.signal, dispatcherIds)
   } else if (demo) {
     console.log('Demo job creation enabled at POST /jobs.')
   }

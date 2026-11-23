@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
-import type { ClaimResponse, OpenJob, OpenJobsResponse } from '../../shared/jobs.ts'
+import type { ClaimedJob, ClaimResponse, OpenJob, OpenJobsResponse } from '../../shared/jobs.ts'
 import { createApi } from '../src/api.ts'
-import { JobStore, parseJob } from '../src/jobs.ts'
+import { JobStore, newJob, parseJob } from '../src/jobs.ts'
 import { pollTelegram, TelegramClient } from '../src/telegram.ts'
 
 const groupId = '-1001234567890'
@@ -14,6 +17,10 @@ const details = {
   pay: '15 USD',
   note: 'leave at reception',
 }
+const card = { telegramChatId: groupId, telegramMessageId: 42, telegramThreadId: 19 }
+const claimedJob: ClaimedJob = {
+  ...details, id: 'test-claim', status: 'claimed', courierName: 'Alex', claimedAt: '2026-11-23T08:00:00.000Z',
+}
 
 function request(path: string, body?: unknown): Request {
   return new Request(`http://localhost:8787${path}`, body === undefined ? {} : {
@@ -23,7 +30,7 @@ function request(path: string, body?: unknown): Request {
   })
 }
 
-function makeUpdate(update_id: number, chatId: string, text: string, senderChatId?: number) {
+function makeUpdate(update_id: number, chatId: string, text: string, senderChatId?: number, userId?: number) {
   return {
     update_id,
     message: {
@@ -32,7 +39,8 @@ function makeUpdate(update_id: number, chatId: string, text: string, senderChatI
       message_thread_id: 19,
       is_topic_message: true,
       text,
-      ...(senderChatId === undefined ? {} : { from: { is_bot: true }, sender_chat: { id: senderChatId } }),
+      from: senderChatId === undefined ? { id: userId } : { is_bot: true },
+      ...(senderChatId === undefined ? {} : { sender_chat: { id: senderChatId } }),
     },
   }
 }
@@ -40,8 +48,8 @@ function makeUpdate(update_id: number, chatId: string, text: string, senderChatI
 async function pollBatch(
   updates: ReturnType<typeof makeUpdate>[],
   sendCard: (body: Record<string, unknown>) => Response,
+  { jobs = new JobStore(), dispatcherIds }: { jobs?: JobStore; dispatcherIds?: ReadonlySet<string> } = {},
 ) {
-  const jobs = new JobStore()
   const stop = new AbortController()
   const offsets: number[] = []
   const telegram = new TelegramClient('test-placeholder', async (input, init) => {
@@ -58,7 +66,7 @@ async function pollBatch(
     return sendCard(body)
   })
 
-  await pollTelegram(telegram, jobs, groupId, stop.signal)
+  await pollTelegram(telegram, jobs, groupId, stop.signal, dispatcherIds)
   return { jobs, offsets }
 }
 
@@ -250,6 +258,153 @@ test('accepts an anonymous admin posting as the configured group and ignores oth
   assert.deepEqual(offsets, [0, 62])
 })
 
+test('limits dispatchers to listed users and anonymous admins when configured', async () => {
+  let posts = 0
+  const { jobs, offsets } = await pollBatch([
+    makeUpdate(70, groupId, demoText, undefined, 1001),
+    makeUpdate(71, groupId, demoText.replace('Central Station', 'Private Office'), undefined, 1002),
+    makeUpdate(72, groupId, demoText.slice(5), undefined, 1001),
+    makeUpdate(73, groupId, demoText.slice(5).replace('Central Station', 'Public Library'), Number(groupId)),
+  ], () => {
+    posts += 1
+    return Response.json({ ok: true, result: { message_id: posts } })
+  }, { dispatcherIds: new Set(['1001']) })
+
+  assert.equal(posts, 2)
+  assert.deepEqual(jobs.listOpen().map(job => job.pickup), ['Central Station', 'Public Library'])
+  assert.deepEqual(offsets, [0, 74])
+})
+
+test('persists open and claimed jobs, Telegram cards, and the polling offset across restarts', async t => {
+  const directory = mkdtempSync(join(tmpdir(), 'kerbcue-state-'))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const dataFile = join(directory, 'data', 'kerbcue.json')
+  const initial = new JobStore(dataFile)
+  const first = newJob(details)
+  const open = newJob({ ...details, pickup: 'Public Library' })
+  initial.add(first, card)
+  const claim = initial.claim(first.id, 'Alex')
+  assert.equal(claim.status, 'claimed')
+  initial.add(open)
+  initial.setTelegramOffset(81)
+
+  const restarted = new JobStore(dataFile)
+  assert.deepEqual(restarted.listOpen(), [open])
+  assert.deepEqual(restarted.claim(first.id, 'Alex'), { ...claim, status: 'already' })
+  assert.equal(restarted.getTelegramOffset(), 81)
+
+  let posts = 0
+  const { offsets } = await pollBatch([
+    makeUpdate(80, groupId, demoText),
+    makeUpdate(81, groupId, demoText),
+    makeUpdate(82, groupId, 'Hello dispatch'),
+  ], () => {
+    posts += 1
+    return Response.json({ ok: true, result: { message_id: 84 } })
+  }, { jobs: restarted })
+  assert.deepEqual(offsets, [81, 83])
+  assert.equal(posts, 1)
+
+  const latest = new JobStore(dataFile)
+  assert.equal(latest.getTelegramOffset(), 83)
+  assert.deepEqual(latest.listOpen().map(job => job.pickup), ['Public Library', 'Central Station'])
+  assert.deepEqual(latest.claim(first.id, 'Alex'), { ...claim, status: 'already' })
+})
+
+test('starts empty and logs once for a corrupt data file', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'kerbcue-corrupt-'))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const dataFile = join(directory, 'kerbcue.json')
+  writeFileSync(dataFile, '{"jobs":[{}],"telegramOffset":15}')
+  const warning = t.mock.method(console, 'warn', () => {})
+  const jobs = new JobStore(dataFile)
+
+  assert.deepEqual(jobs.listOpen(), [])
+  assert.equal(jobs.getTelegramOffset(), 0)
+  assert.equal(warning.mock.callCount(), 1)
+})
+
+test('returns the existing claim to the same courier and rejects any other courier', async () => {
+  const jobs = new JobStore()
+  const job = newJob(details)
+  jobs.add(job, card)
+  let calls = 0
+  const telegram = new TelegramClient('test-placeholder', async () => {
+    calls += 1
+    return Response.json({ ok: true, result: { message_id: 42 } })
+  })
+  const api = createApi({ jobs, telegram, courierName: 'Courier', publicOrigin: webOrigin, demo: false })
+  const claimPath = `/jobs/${job.id}/claim`
+  const first = await api(request(claimPath, { courierName: 'Alex' }))
+  assert.equal(first.status, 200)
+  const claimed = await first.json() as ClaimResponse
+  assert.equal(claimed.telegramSynced, true)
+
+  const repeat = await api(request(claimPath, { courierName: 'Alex' }))
+  assert.equal(repeat.status, 200)
+  assert.deepEqual(await repeat.json(), { job: claimed.job, telegramSynced: null })
+  assert.equal((await api(request(claimPath, { courierName: 'Another courier' }))).status, 409)
+  assert.equal(calls, 2)
+})
+
+test('retries the rate-limited claim notification once without repeating the other call', async t => {
+  t.mock.method(console, 'error', () => {})
+  const edits: unknown[] = []
+  let replies = 0
+  const telegram = new TelegramClient('test-placeholder', async (input, init) => {
+    const outgoing = new Request(input, init)
+    if (new URL(outgoing.url).pathname.endsWith('/editMessageText')) {
+      edits.push(await outgoing.json())
+      return Response.json({
+        ok: false, error_code: 429, parameters: { retry_after: 0 },
+      }, { status: 429 })
+    }
+    replies += 1
+    return Response.json({ ok: true, result: { message_id: 43 } })
+  })
+
+  assert.equal(await telegram.syncClaim(card, claimedJob), false)
+  assert.equal(edits.length, 2)
+  assert.deepEqual(edits[0], edits[1])
+  assert.equal(replies, 1)
+})
+
+test('retries claim notifications rejected with a Telegram server error', async () => {
+  let edits = 0
+  let replies = 0
+  const telegram = new TelegramClient('test-placeholder', async input => {
+    if (new URL(String(input)).pathname.endsWith('/sendMessage')) {
+      replies += 1
+      if (replies === 1) return new Response(null, { status: 503 })
+    } else {
+      edits += 1
+    }
+    return Response.json({ ok: true, result: { message_id: 43 } })
+  })
+
+  assert.equal(await telegram.syncClaim(card, claimedJob), true)
+  assert.equal(edits, 1)
+  assert.equal(replies, 2)
+})
+
+test('does not retry a claim reply when a network error leaves delivery uncertain', async t => {
+  t.mock.method(console, 'error', () => {})
+  let edits = 0
+  let replies = 0
+  const telegram = new TelegramClient('test-placeholder', async input => {
+    if (new URL(String(input)).pathname.endsWith('/sendMessage')) {
+      replies += 1
+      throw new TypeError('Connection lost after sending the request')
+    }
+    edits += 1
+    return Response.json({ ok: true, result: { message_id: 42 } })
+  })
+
+  assert.equal(await telegram.syncClaim(card, claimedJob), false)
+  assert.equal(edits, 1)
+  assert.equal(replies, 1)
+})
+
 test('creates and claims a token-free demo job with the configured courier and CORS preflight', async () => {
   const api = createApi({ jobs: new JobStore(), courierName: 'Demo Courier', publicOrigin: webOrigin, demo: true })
   const created = await api(request('/jobs', {}))
@@ -265,7 +420,7 @@ test('creates and claims a token-free demo job with the configured courier and C
   assert.equal(preflight.status, 204)
   assert.equal(preflight.headers.get('Access-Control-Allow-Origin'), webOrigin)
   assert.match(preflight.headers.get('Access-Control-Allow-Methods') ?? '', /POST/)
-  assert.equal(preflight.headers.get('Access-Control-Allow-Headers'), 'Content-Type')
+  assert.match(preflight.headers.get('Access-Control-Allow-Headers') ?? '', /Content-Type/i)
   assert.equal((await api(request(claimPath, { courierName: '' }))).status, 400)
 
   const claimed = await api(request(claimPath, {}))
@@ -273,5 +428,5 @@ test('creates and claims a token-free demo job with the configured courier and C
   const response = await claimed.json() as ClaimResponse
   assert.equal(response.job.courierName, 'Demo Courier')
   assert.equal(response.telegramSynced, null)
-  assert.equal((await api(request(claimPath, {}))).status, 409)
+  assert.equal((await api(request(claimPath, { courierName: 'Another courier' }))).status, 409)
 })

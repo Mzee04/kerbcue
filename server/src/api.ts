@@ -100,7 +100,7 @@ export function createApi({ jobs, telegram, courierName, publicOrigin, demo }: A
         if (result.status === 'missing') throw new HttpError(404, 'Job not found.')
         if (result.status === 'conflict') throw new HttpError(409, 'Job already claimed.')
 
-        const telegramSynced = result.card && telegram
+        const telegramSynced = result.status === 'claimed' && result.card && telegram
           ? await telegram.syncClaim(result.card, result.job)
           : null
         return json({ job: result.job, telegramSynced } satisfies ClaimResponse)

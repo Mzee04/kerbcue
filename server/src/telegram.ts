@@ -8,7 +8,7 @@ interface TelegramMessage {
   message_thread_id?: number
   is_topic_message?: boolean
   chat: { id: number; type: string }
-  from?: { is_bot?: boolean }
+  from?: { id?: number; is_bot?: boolean }
   sender_chat?: { id: number }
   text?: string
 }
@@ -155,14 +155,30 @@ export class TelegramClient {
     }, signal)
   }
 
+  private async notifyClaim(method: 'editMessageText' | 'sendMessage', body: object): Promise<unknown> {
+    try {
+      return await this.call(method, body)
+    } catch (error) {
+      const rejection = error instanceof TelegramError ? error.rejection : undefined
+      const status = rejection?.status
+      const retryAfter = rejection?.retryAfter
+      const wait = status === 429 && retryAfter !== undefined
+        ? Math.min(5000, retryAfter * 1000)
+        : status !== undefined && status >= 500 ? 500 : undefined
+      if (wait === undefined) throw error
+      if (wait > 0) await delay(wait)
+      return this.call(method, body)
+    }
+  }
+
   async syncClaim(card: TelegramCard, job: ClaimedJob): Promise<boolean> {
     const [edit, reply] = await Promise.all([
-      this.call('editMessageText', {
+      this.notifyClaim('editMessageText', {
         chat_id: card.telegramChatId,
         message_id: card.telegramMessageId,
         text: cardText(job),
       }).catch(reportTelegramFailure),
-      this.call('sendMessage', {
+      this.notifyClaim('sendMessage', {
         chat_id: card.telegramChatId,
         message_thread_id: card.telegramThreadId,
         reply_parameters: { message_id: card.telegramMessageId, allow_sending_without_reply: true },
@@ -186,6 +202,7 @@ export async function ingestUpdate(
   update: TelegramUpdate,
   seenGroups: Set<string>,
   signal?: AbortSignal,
+  dispatcherIds?: ReadonlySet<string>,
 ): Promise<void> {
   const message = update.message
   if (!message || !['group', 'supergroup'].includes(message.chat.type)) return
@@ -197,22 +214,21 @@ export async function ingestUpdate(
   }
   const isAnonymousAdmin = message.sender_chat?.id === message.chat.id
   if (chatId !== groupId || (message.from?.is_bot && !isAnonymousAdmin) || !message.text) return
+  const requireDispatcher = dispatcherIds !== undefined && !isAnonymousAdmin
+  if (requireDispatcher && !dispatcherIds.has(String(message.from?.id))) return
 
-  const details = parseJob(message.text)
+  const details = parseJob(message.text, requireDispatcher)
   if (!details) return
 
   const job = newJob(details)
   const threadId = message.is_topic_message ? message.message_thread_id : undefined
+  const nextOffset = update.update_id + 1
   const maxRetries = 3
+  let sent: TelegramMessage | undefined
   for (let retry = 0; retry <= maxRetries && !signal?.aborted; retry++) {
     try {
-      const sent = await telegram.sendOpenCard(chatId, job, threadId, signal)
-      jobs.add(job, {
-        telegramChatId: chatId,
-        telegramMessageId: sent.message_id,
-        telegramThreadId: threadId,
-      })
-      return
+      sent = await telegram.sendOpenCard(chatId, job, threadId, signal)
+      break
     } catch (error) {
       if (signal?.aborted) break
       reportTelegramFailure(error)
@@ -224,7 +240,15 @@ export async function ingestUpdate(
       if (wait > 0) await delay(wait, undefined, { signal }).catch(() => undefined)
     }
   }
-  jobs.add(job)
+  if (sent) {
+    jobs.add(job, {
+      telegramChatId: chatId,
+      telegramMessageId: sent.message_id,
+      telegramThreadId: threadId,
+    }, nextOffset)
+    return
+  }
+  jobs.add(job, undefined, nextOffset)
   console.warn(`Kerbcue job ${job.id} added without a Telegram card.`)
 }
 
@@ -233,8 +257,9 @@ export async function pollTelegram(
   jobs: JobStore,
   groupId: string | undefined,
   signal: AbortSignal,
+  dispatcherIds?: ReadonlySet<string>,
 ): Promise<void> {
-  let offset = 0
+  let offset = jobs.getTelegramOffset()
   let failures = 0
   const seenGroups = new Set<string>()
 
@@ -259,8 +284,15 @@ export async function pollTelegram(
     for (const update of updates) {
       if (signal.aborted) return
       if (update.update_id < offset) continue
-      await ingestUpdate(telegram, jobs, groupId, update, seenGroups, signal).catch(reportTelegramFailure)
-      offset = update.update_id + 1
+      const nextOffset = update.update_id + 1
+      try {
+        await ingestUpdate(telegram, jobs, groupId, update, seenGroups, signal, dispatcherIds)
+        jobs.setTelegramOffset(nextOffset)
+      } catch {
+        console.error('Kerbcue could not save the Telegram update. Polling stopped.')
+        return
+      }
+      offset = nextOffset
     }
   }
 }

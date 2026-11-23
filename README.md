@@ -56,21 +56,22 @@ Post a job command in the group.
 /job pickup: Central Station | drop: 42 Market Street | pay: 15 USD | note: leave at reception
 ```
 
-The `pickup`, `drop`, and `pay` fields are required. `note` is optional. Dispatchers can omit `/job` and paste the same fields with pipes or one field per line.
+The `pickup`, `drop`, and `pay` fields are required. `note` is optional. When `TELEGRAM_DISPATCHER_IDS` is unset, dispatchers can also paste the fields without `/job`, separated by pipes or one field per line.
 
-The backend uses [getUpdates](https://core.telegram.org/bots/api#getupdates) to long-poll without a public webhook. It posts an open card with a job ID using [sendMessage](https://core.telegram.org/bots/api#sendmessage). When a courier taps, the plugin sends the visible job ID and the name supplied by the backend’s `COURIER_NAME` setting. The backend reserves the job before sending two Telegram requests in parallel. It marks the original card claimed with the courier name and UTC time and posts a reply in the group. The reply can still post if the card was deleted. A second claim returns HTTP 409. The API returns `telegramSynced: false` if either Telegram write fails, and the winning claim stays recorded. [Telegram editMessageText](https://core.telegram.org/bots/api#editmessagetext)
+The backend uses [getUpdates](https://core.telegram.org/bots/api#getupdates) to long-poll without a public webhook. It posts an open card with a job ID using [sendMessage](https://core.telegram.org/bots/api#sendmessage). When a courier taps, the plugin sends the visible job ID and the name supplied by the backend’s `COURIER_NAME` setting. The backend reserves the job before sending two Telegram requests in parallel. It marks the original card claimed with the courier name and UTC time and posts a reply in the group. The reply can still post if the card was deleted. A different courier receives HTTP 409 on a repeat claim. The same courier receives the existing claim with `telegramSynced: null` and no additional Telegram writes. The API returns `telegramSynced: false` if either Telegram write fails, and the winning claim stays recorded. [Telegram editMessageText](https://core.telegram.org/bots/api#editmessagetext)
 
 `POST /jobs` creates demo jobs when the token is blank and `NODE_ENV` is anything other than `production`.
 
 ## Security and limits
 
-The backend listens on all interfaces (`0.0.0.0`) and has no authentication. Anyone who can reach port 8787 can see open jobs, including pickup and drop addresses, and claim them under a supplied courier name. Run it only on a trusted network or behind your own authentication. `PUBLIC_ORIGIN` defaults to `*` when unset.
-
-Jobs live in memory and reset when the backend restarts. Telegram may redeliver job posts from the past 24 hours that the backend had yet to confirm. If Telegram rejects a card post, Kerbcue retries it up to three times. If the result is uncertain or retries run out, Kerbcue keeps the job open without a card. A claim still works and returns `telegramSynced: null`.
+- **Backend access.** The backend listens on all interfaces (`0.0.0.0`) and has no login. Anyone who can reach port 8787 can see pickup and drop addresses and claim jobs under a supplied courier name. The backend trusts the supplied courier name, so run it on a trusted network or put your own per-courier authentication in front of it. No API keys ship inside the plugin. `PUBLIC_ORIGIN` defaults to `*` when unset.
+- **Dispatchers.** By default, members of the configured Telegram group can post jobs. Set `TELEGRAM_DISPATCHER_IDS` to a comma-separated list of positive Telegram user IDs to restrict `/job` intake to those users and anonymous admins posting as the group. Anonymous admins can still use structured plain text.
+- **Restarts.** By default, jobs and the Telegram offset live in memory and reset on restart. Set `KERBCUE_DATA_FILE`, for example to `./data/kerbcue.json`, to save both. Telegram may redeliver unconfirmed posts from the past 24 hours. Kerbcue uses the saved offset to skip updates it already recorded.
+- **Telegram card failures.** If Telegram rejects a card post, Kerbcue retries it up to three times. If the result is uncertain or retries run out, Kerbcue keeps the job open without a card. A claim still works and returns `telegramSynced: null`.
 
 ## Configure the backend origin
 
-Edit the first entry under `permissions` → `network` → `whitelist` in `app.json` to change the backend URL. The plugin reads its API base from that same entry, so its requests and the whitelist use the same origin. Set a full origin with no trailing slash. Use HTTP for local development and HTTPS for a hosted backend.
+Edit the first entry under `permissions` → `network` → `whitelist` in `app.json` to change the backend URL. The plugin reads its API base from that same entry, so its requests and the whitelist use the same origin. Set a full origin with no trailing slash. Keep `http://localhost:8787` for the local simulator. For a deployed headset, use an HTTPS backend the phone can reach.
 
 For a phone on your LAN, replace `http://localhost:8787` with `http://<LAN-IP>:8787` and set the backend’s `PUBLIC_ORIGIN` to `http://<LAN-IP>:5173`. In the simulator the Vite origin is `http://localhost:5173`. For a packaged WebView, set `PUBLIC_ORIGIN` to the WebView origin, or use `*` for a local demo. The backend handles the JSON claim request’s CORS preflight. [Even Hub networking](https://hub.evenrealities.com/docs/build/networking)
 

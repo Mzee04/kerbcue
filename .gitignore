@@ -1,5 +1,6 @@
 node_modules/
 dist/
+data/
 .env
 .env.*
 !.env.example
@@ -8,3 +9,4 @@ dist/
 ._*
 CODEX_PROMPT.md
 CODEX_FIX_PROMPT.md
+CODEX_FIX2_PROMPT.md

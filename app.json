@@ -1,0 +1,16 @@
+{
+  "package_id": "com.mzee04.kerbcue",
+  "edition": "202601",
+  "name": "Kerbcue",
+  "version": "0.1.0",
+  "min_sdk_version": "0.0.16",
+  "entrypoint": "index.html",
+  "permissions": [
+    {
+      "name": "network",
+      "desc": "Loads open delivery jobs and sends a claim to the Kerbcue backend.",
+      "whitelist": ["http://localhost:8787"]
+    }
+  ],
+  "supported_languages": ["en"]
+}

@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+*.ehpk
+.DS_Store
+CODEX_PROMPT.md

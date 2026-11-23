@@ -23,6 +23,45 @@ function request(path: string, body?: unknown): Request {
   })
 }
 
+function makeUpdate(update_id: number, chatId: string, text: string, senderChatId?: number) {
+  return {
+    update_id,
+    message: {
+      chat: { id: Number(chatId), type: 'supergroup' },
+      message_id: 7,
+      message_thread_id: 19,
+      is_topic_message: true,
+      text,
+      ...(senderChatId === undefined ? {} : { from: { is_bot: true }, sender_chat: { id: senderChatId } }),
+    },
+  }
+}
+
+async function pollBatch(
+  updates: ReturnType<typeof makeUpdate>[],
+  sendCard: (body: Record<string, unknown>) => Response,
+) {
+  const jobs = new JobStore()
+  const stop = new AbortController()
+  const offsets: number[] = []
+  const telegram = new TelegramClient('test-placeholder', async (input, init) => {
+    const outgoing = new Request(input, init)
+    const method = new URL(outgoing.url).pathname.split('/').at(-1)
+    const body = await outgoing.json()
+    if (method === 'getUpdates') {
+      offsets.push(body.offset)
+      if (offsets.length === 1) return Response.json({ ok: true, result: updates })
+      stop.abort()
+      return Response.json({ ok: true, result: [] })
+    }
+    assert.equal(method, 'sendMessage')
+    return sendCard(body)
+  })
+
+  await pollTelegram(telegram, jobs, groupId, stop.signal)
+  return { jobs, offsets }
+}
+
 test('parses a /job command and clear plain-text blocks, and ignores other chat', () => {
   assert.deepEqual(parseJob(demoText), details)
   assert.deepEqual(parseJob(demoText.slice(5)), details)
@@ -41,17 +80,8 @@ test('polls only the configured group and replies to the canonical Telegram card
   const stop = new AbortController()
   const calls: { method: string; body: Record<string, unknown> }[] = []
   const editStarted = Promise.withResolvers<void>()
+  const replyStarted = Promise.withResolvers<void>()
   const finishEdit = Promise.withResolvers<void>()
-  const makeUpdate = (update_id: number, chatId: string, text: string) => ({
-    update_id,
-    message: {
-      chat: { id: Number(chatId), type: 'supergroup' },
-      message_id: 7,
-      message_thread_id: 19,
-      is_topic_message: true,
-      text,
-    },
-  })
 
   const telegram = new TelegramClient('test-placeholder', async (input, init) => {
     const outgoing = new Request(input, init)
@@ -78,6 +108,7 @@ test('polls only the configured group and replies to the canonical Telegram card
       editStarted.resolve()
       await finishEdit.promise
     }
+    if (method === 'sendMessage' && body.reply_parameters) replyStarted.resolve()
     return Response.json({ ok: true, result: { message_id: 42 } })
   })
 
@@ -100,7 +131,7 @@ test('polls only the configured group and replies to the canonical Telegram card
   const claimPath = `/jobs/${job.id}/claim`
   const first = api(request(claimPath, { courierName: 'Alex' }))
   try {
-    await editStarted.promise
+    await Promise.all([editStarted.promise, replyStarted.promise])
     assert.equal((await api(request(claimPath, { courierName: 'Second courier' }))).status, 409)
     assert.deepEqual((await (await api(request('/jobs'))).json()).jobs, [])
   } finally {
@@ -113,16 +144,110 @@ test('polls only the configured group and replies to the canonical Telegram card
   assert.equal(response.job.courierName, 'Alex')
   assert.equal(response.telegramSynced, true)
   assert.ok(Date.parse(response.job.claimedAt) > 0)
-  assert.deepEqual(calls.slice(3).map(({ method }) => method), ['editMessageText', 'sendMessage'])
-  assert.equal(calls[3].body.chat_id, groupId)
-  assert.equal(calls[3].body.message_id, 42)
-  assert.match(String(calls[3].body.text), /Claimed by Alex at \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC/)
-  assert.deepEqual(calls[4].body, {
+  const claimCalls = calls.slice(3)
+  assert.equal(claimCalls.length, 2)
+  const edit = claimCalls.find(({ method }) => method === 'editMessageText')
+  const reply = claimCalls.find(({ method }) => method === 'sendMessage')
+  assert.ok(edit && reply)
+  assert.equal(edit.body.chat_id, groupId)
+  assert.equal(edit.body.message_id, 42)
+  assert.match(String(edit.body.text), /Claimed by Alex at \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC/)
+  assert.deepEqual(reply.body, {
     chat_id: groupId,
     message_thread_id: 19,
-    reply_parameters: { message_id: 42 },
+    reply_parameters: { message_id: 42, allow_sending_without_reply: true },
     text: 'Alex claimed the delivery.',
   })
+})
+
+test('keeps a card-less job and confirms the update after an uncertain network failure', async t => {
+  t.mock.method(console, 'error', () => {})
+  const warnings = t.mock.method(console, 'warn', () => {})
+  let posts = 0
+  const { jobs, offsets } = await pollBatch([makeUpdate(40, groupId, demoText)], () => {
+    posts += 1
+    throw new TypeError('Connection lost after sending the request')
+  })
+
+  assert.equal(posts, 1)
+  assert.deepEqual(offsets, [0, 41])
+  const open = jobs.listOpen()
+  assert.equal(open.length, 1)
+  const [job] = open
+  assert.deepEqual(job, { ...details, id: job.id, status: 'open' })
+  assert.deepEqual(warnings.mock.calls.map(call => call.arguments), [
+    [`Kerbcue job ${job.id} added without a Telegram card.`],
+  ])
+  const api = createApi({ jobs, courierName: 'Courier', publicOrigin: webOrigin, demo: false })
+  const claimed = await api(request(`/jobs/${job.id}/claim`, {}))
+  assert.equal(claimed.status, 200)
+  assert.equal((await claimed.json() as ClaimResponse).telegramSynced, null)
+})
+
+test('retries a Telegram 429 and stores the posted card once', async t => {
+  const errors = t.mock.method(console, 'error', () => {})
+  const posts: Record<string, unknown>[] = []
+  const { jobs, offsets } = await pollBatch([makeUpdate(50, groupId, demoText)], body => {
+    posts.push(body)
+    if (posts.length === 1) {
+      return Response.json({
+        ok: false, error_code: 429, description: 'Too Many Requests', parameters: { retry_after: 0 },
+      }, { status: 429 })
+    }
+    return Response.json({ ok: true, result: { message_id: 73 } })
+  })
+
+  assert.equal(posts.length, 2)
+  assert.deepEqual(posts[0], posts[1])
+  assert.deepEqual(offsets, [0, 51])
+  assert.match(errors.mock.calls[0].arguments[0], /HTTP 429, Too Many Requests/)
+  const open = jobs.listOpen()
+  assert.equal(open.length, 1)
+  const result = jobs.claim(open[0].id, 'Alex')
+  assert.equal(result.status, 'claimed')
+  assert.deepEqual(result.card, { telegramChatId: groupId, telegramMessageId: 73, telegramThreadId: 19 })
+})
+
+test('logs a safe reason after getUpdates fails and resumes when Telegram responds', {
+  timeout: 4000,
+}, async t => {
+  const errors = t.mock.method(console, 'error', () => {})
+  const recovery = t.mock.method(console, 'log', () => {})
+  const stop = new AbortController()
+  const token = '123456:private-test-token'
+  let attempts = 0
+  const telegram = new TelegramClient(token, async input => {
+    attempts += 1
+    if (attempts === 1) {
+      throw new TypeError(`Fetch exploded at ${input}`, { cause: { code: 'ECONNRESET' } })
+    }
+    if (attempts === 3) stop.abort()
+    return Response.json({ ok: true, result: [] })
+  })
+
+  await pollTelegram(telegram, new JobStore(), groupId, stop.signal)
+
+  assert.equal(attempts, 3)
+  const logged = errors.mock.calls.map(call => call.arguments.join(' ')).join('\n')
+  assert.match(logged, /Telegram getUpdates failed \(ECONNRESET\)/)
+  assert.ok(!logged.includes(token))
+  assert.doesNotMatch(logged, /api\.telegram\.org|Fetch exploded/)
+  assert.deepEqual(recovery.mock.calls.map(call => call.arguments), [['Telegram polling recovered after 1 failure.']])
+})
+
+test('accepts an anonymous admin posting as the configured group and ignores other bots', async () => {
+  let posts = 0
+  const { jobs, offsets } = await pollBatch([
+    makeUpdate(60, groupId, demoText, -2000),
+    makeUpdate(61, groupId, demoText, Number(groupId)),
+  ], () => {
+    posts += 1
+    return Response.json({ ok: true, result: { message_id: 74 } })
+  })
+
+  assert.equal(posts, 1)
+  assert.equal(jobs.listOpen().length, 1)
+  assert.deepEqual(offsets, [0, 62])
 })
 
 test('creates and claims a token-free demo job with the configured courier and CORS preflight', async () => {

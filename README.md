@@ -1,6 +1,6 @@
 # Kerbcue
 
-Kerbcue lets couriers claim delivery jobs with a tap on Even Realities G2 glasses or the optional R1 ring. Dispatchers post jobs in a Telegram group. The glasses show one open job at a time, and Kerbcue updates the Telegram job card when someone claims it.
+Kerbcue lets couriers claim delivery jobs with a tap on Even Realities G2 glasses. R1 ring taps use the same claim action. Physical R1 testing is pending. Dispatchers post jobs in a Telegram group. The glasses show one open job at a time, and Kerbcue updates the Telegram job card when someone claims it.
 
 Built by Toyyib Olamilekan for Messaging & News and Best Telegram Integration at Heads Up: Even Realities. Kerbcue started on 23 Nov 2026 after the build window opened at 08:00 UTC. The project did not exist before that date. It started from the official Even Hub minimal template. [Hackathon](https://dorahacks.io/hackathon/even-realities/detail) · [Template](https://github.com/even-realities/evenhub-templates/tree/main/minimal)
 
@@ -58,9 +58,15 @@ Post a job command in the group.
 
 The `pickup`, `drop`, and `pay` fields are required. `note` is optional. Dispatchers can omit `/job` and paste the same fields with pipes or one field per line.
 
-The backend uses [getUpdates](https://core.telegram.org/bots/api#getupdates) to long-poll without a public webhook. It posts an open card with a job ID using [sendMessage](https://core.telegram.org/bots/api#sendmessage). When a courier taps, the plugin sends the visible job ID and the name supplied by the backend’s `COURIER_NAME` setting. The backend reserves the job before sending Telegram notifications. It marks the bot’s original card claimed with the courier name and UTC time using [editMessageText](https://core.telegram.org/bots/api#editmessagetext), then replies to that card in the same group. A second claim returns HTTP 409. The API returns `telegramSynced: false` if either Telegram write fails, and the winning claim stays recorded.
+The backend uses [getUpdates](https://core.telegram.org/bots/api#getupdates) to long-poll without a public webhook. It posts an open card with a job ID using [sendMessage](https://core.telegram.org/bots/api#sendmessage). When a courier taps, the plugin sends the visible job ID and the name supplied by the backend’s `COURIER_NAME` setting. The backend reserves the job before sending two Telegram requests in parallel. It marks the original card claimed with the courier name and UTC time and posts a reply in the group. The reply can still post if the card was deleted. A second claim returns HTTP 409. The API returns `telegramSynced: false` if either Telegram write fails, and the winning claim stays recorded. [Telegram editMessageText](https://core.telegram.org/bots/api#editmessagetext)
 
-Jobs live in memory and reset when the backend restarts. `POST /jobs` creates demo jobs when the token is blank and `NODE_ENV` is anything other than `production`. The claim API trusts the supplied courier name.
+`POST /jobs` creates demo jobs when the token is blank and `NODE_ENV` is anything other than `production`.
+
+## Security and limits
+
+The backend listens on all interfaces (`0.0.0.0`) and has no authentication. Anyone who can reach port 8787 can see open jobs, including pickup and drop addresses, and claim them under a supplied courier name. Run it only on a trusted network or behind your own authentication. `PUBLIC_ORIGIN` defaults to `*` when unset.
+
+Jobs live in memory and reset when the backend restarts. Telegram may redeliver job posts from the past 24 hours that the backend had yet to confirm. If Telegram rejects a card post, Kerbcue retries it up to three times. If the result is uncertain or retries run out, Kerbcue keeps the job open without a card. A claim still works and returns `telegramSynced: null`.
 
 ## Configure the backend origin
 

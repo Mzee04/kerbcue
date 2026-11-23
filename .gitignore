@@ -5,4 +5,6 @@ dist/
 !.env.example
 *.ehpk
 .DS_Store
+._*
 CODEX_PROMPT.md
+CODEX_FIX_PROMPT.md

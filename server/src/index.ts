@@ -1,7 +1,7 @@
 import { createServer } from 'node:http'
 import { Readable } from 'node:stream'
 import { createApi } from './api.ts'
-import { JobStore } from './jobs.ts'
+import { dataFileFromEnv, JobStore } from './jobs.ts'
 import { cardSyncFor } from './cardsync.ts'
 import { createOsrmRouter, routingLabel } from './routing.ts'
 import { pollTelegram, TelegramClient } from './telegram.ts'
@@ -32,7 +32,8 @@ const router = routingUrl ? createOsrmRouter(routingUrl, routingProfile) : undef
 
 const telegram = token ? new TelegramClient(token) : undefined
 const botUsername = telegram ? await telegram.getUsername() : undefined
-const jobs = new JobStore(process.env.KERBCUE_DATA_FILE?.trim() || undefined)
+const dataFile = dataFileFromEnv()
+const jobs = new JobStore(dataFile)
 const demo = !telegram && process.env.NODE_ENV !== 'production'
 const api = createApi({
   jobs,
@@ -74,6 +75,7 @@ server.on('error', (error: NodeJS.ErrnoException) => {
 })
 server.listen(port, '0.0.0.0', () => {
   console.log(`Kerbcue API listening on port ${port}.`)
+  console.log(dataFile ? `Job data: ${dataFile}` : 'Job data: in-memory (reset on restart).')
   if (telegram) {
     console.log(groupId ? 'Telegram polling enabled.' : 'Telegram polling for group chat ID discovery.')
     void pollTelegram(telegram, jobs, groupId, stop.signal, dispatcherIds, router)

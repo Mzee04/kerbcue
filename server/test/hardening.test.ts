@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import type { ClaimResponse, OpenJobsResponse, StatusResponse } from '../../shared/jobs.ts'
+import type { ClaimResponse, Job, OpenJobsResponse, StatusResponse } from '../../shared/jobs.ts'
 import { deliveryConfirmMs, deliveryTap, isConfirming } from '../../src/confirm.ts'
 import { createApi } from '../src/api.ts'
 import { CardSync, cardSyncFor } from '../src/cardsync.ts'
-import { JobStore, linkTtlMs, newJob } from '../src/jobs.ts'
+import { dataFileFromEnv, defaultDataFile, JobStore, linkTtlMs, newJob } from '../src/jobs.ts'
 import { routingLabel } from '../src/routing.ts'
 import { pollTelegram, TelegramClient } from '../src/telegram.ts'
 
@@ -298,6 +298,8 @@ test('fix 5: claims re-check group membership with a cache and only block on a d
   status = 'left'
   const blocked = await api(request(`/jobs/${add()}/claim`, {}, bolaKey))
   assert.equal(blocked.status, 403)
+  assert.match(await blocked.text(), /no longer in the dispatch group/)
+  assert.equal(jobs.courierFor(bolaKey), undefined)
   status = 'down'
   assert.equal((await api(request(`/jobs/${add()}/claim`, {}, linkDevice(jobs, { id: 'tg:1004', name: 'Dee' })))).status, 200)
 })
@@ -327,4 +329,120 @@ test('fix 8: the route label comes from the server, not the request path', () =>
   assert.equal(routingLabel('https://osrm.internal.example'), 'road')
   assert.equal(routingLabel('https://osrm.internal.example', 'bike'), 'bike')
   assert.throws(() => routingLabel('https://osrm.internal.example', 'bike route'), /one short word/)
+})
+
+test('fix 1: KERBCUE_DATA_FILE defaults to ./data/kerbcue.json and memory opts out', () => {
+  assert.equal(defaultDataFile, './data/kerbcue.json')
+  assert.equal(dataFileFromEnv(undefined), defaultDataFile)
+  assert.equal(dataFileFromEnv(''), defaultDataFile)
+  assert.equal(dataFileFromEnv('  '), defaultDataFile)
+  assert.equal(dataFileFromEnv('memory'), undefined)
+  assert.equal(dataFileFromEnv('MEMORY'), undefined)
+  assert.equal(dataFileFromEnv(' ./custom/jobs.json '), './custom/jobs.json')
+})
+
+test('fix 5: job lists and status updates re-check membership and unlink a removed member', async t => {
+  t.mock.method(console, 'error', () => {})
+  const memberOf = (status: string | 'down') => fakeTelegram(call => {
+    if (call.method !== 'getChatMember') return undefined
+    if (status === 'down') networkDown()
+    return Response.json({ ok: true, result: { status } })
+  })
+
+  // A still-member courier can list jobs and advance a claim; the 5-minute cache avoids a repeat lookup.
+  const jobs = new JobStore()
+  const members = memberOf('member')
+  const api = createApi({ jobs, telegram: members.telegram, groupId, publicOrigin: webOrigin, demo: false })
+  const alexKey = linkDevice(jobs, alex)
+  const job = newJob(details)
+  jobs.add(job, card)
+  assert.equal((await api(request(`/jobs/${job.id}/claim`, {}, alexKey))).status, 200)
+  const listed = await (await api(request('/jobs', undefined, alexKey))).json() as OpenJobsResponse
+  assert.equal(listed.active[0].status, 'claimed')
+  assert.equal((await api(request(`/jobs/${job.id}/status`, { status: 'picked_up' }, alexKey))).status, 200)
+  assert.equal(members.calls.filter(call => call.method === 'getChatMember').length, 1)
+
+  // A fresh client that already knows the account left: listing hides addresses and unlinks the device.
+  const leftJobs = new JobStore()
+  const leftKey = linkDevice(leftJobs, alex)
+  const openJob = newJob(details)
+  leftJobs.add(openJob)
+  const leftList = createApi({ jobs: leftJobs, telegram: memberOf('left').telegram, groupId, publicOrigin: webOrigin, demo: false })
+  const deniedList = await leftList(request('/jobs', undefined, leftKey))
+  assert.equal(deniedList.status, 403)
+  const deniedBody = await deniedList.json() as { error?: string; jobs?: unknown[] }
+  assert.match(deniedBody.error ?? '', /no longer in the dispatch group/)
+  assert.equal(deniedBody.jobs, undefined)
+  assert.equal(leftJobs.courierFor(leftKey), undefined)
+
+  // A removed member cannot mark their existing claim picked up, and the job is unchanged.
+  const statusJobs = new JobStore()
+  const statusKey = linkDevice(statusJobs, alex)
+  const claimed = newJob(details)
+  statusJobs.add(claimed, card)
+  assert.equal(statusJobs.claim(claimed.id, alex).status, 'claimed')
+  const leftStatus = createApi({ jobs: statusJobs, telegram: memberOf('left').telegram, groupId, publicOrigin: webOrigin, demo: false })
+  const deniedStatus = await leftStatus(request(`/jobs/${claimed.id}/status`, { status: 'picked_up' }, statusKey))
+  assert.equal(deniedStatus.status, 403)
+  assert.equal(statusJobs.get(claimed.id)?.job.status, 'claimed')
+  assert.equal(statusJobs.courierFor(statusKey), undefined)
+  assert.equal((await leftStatus(request(`/jobs/${claimed.id}/status`, { status: 'picked_up' }, statusKey))).status, 401)
+
+  // Telegram being down does not block a still-linked courier.
+  const downJobs = new JobStore()
+  const bolaKey = linkDevice(downJobs, bola)
+  const bolaJob = newJob(details)
+  downJobs.add(bolaJob)
+  downJobs.claim(bolaJob.id, bola)
+  const downApi = createApi({ jobs: downJobs, telegram: memberOf('down').telegram, groupId, publicOrigin: webOrigin, demo: false })
+  const open = await (await downApi(request('/jobs', undefined, bolaKey))).json() as OpenJobsResponse
+  assert.equal(open.active[0].id, bolaJob.id)
+  assert.equal((await downApi(request(`/jobs/${bolaJob.id}/status`, { status: 'picked_up' }, bolaKey))).status, 200)
+})
+
+test('fix 3: a persistence failure during card sync is logged and does not become an unhandled rejection', async t => {
+  t.mock.method(console, 'error', () => {})
+  let fail = true
+  class FlakyStore extends JobStore {
+    override markSynced(id: string, job: Job): boolean {
+      if (fail) throw new Error('disk full')
+      return super.markSynced(id, job)
+    }
+  }
+  const jobs = new FlakyStore()
+  const job = newJob(details)
+  jobs.add(job, card)
+  jobs.claim(job.id, alex)
+  const { telegram, calls } = fakeTelegram()
+  const syncer = new CardSync(telegram, jobs)
+
+  const unhandled: unknown[] = []
+  const onUnhandled = (reason: unknown) => unhandled.push(reason)
+  process.on('unhandledRejection', onUnhandled)
+  t.after(() => process.off('unhandledRejection', onUnhandled))
+
+  void syncer.sync(job.id)
+  await new Promise(resolve => setTimeout(resolve, 50))
+  assert.equal(unhandled.length, 0)
+  assert.equal(jobs.get(job.id)?.syncPending, true)
+
+  fail = false
+  assert.equal(await syncer.sync(job.id), true)
+  assert.equal(jobs.get(job.id)?.syncPending, false)
+  assert.match(edits(calls).at(-1) ?? '', /Status: Claimed by Alex/)
+  assert.equal(unhandled.length, 0)
+})
+
+test('fix 6: refuses to start if a corrupt data file cannot be moved aside', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'kerbcue-corrupt-locked-'))
+  t.after(() => {
+    try { chmodSync(directory, 0o700) } catch { /* still need to try the removal */ }
+    rmSync(directory, { recursive: true, force: true })
+  })
+  const dataFile = join(directory, 'kerbcue.json')
+  writeFileSync(dataFile, '{not json')
+  chmodSync(directory, 0o555)
+  assert.throws(() => new JobStore(dataFile), /corrupt at .*kerbcue\.json.*could not be moved aside.*Refusing to start/s)
+  chmodSync(directory, 0o700)
+  assert.equal(readFileSync(dataFile, 'utf8'), '{not json')
 })

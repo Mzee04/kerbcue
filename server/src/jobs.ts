@@ -156,6 +156,16 @@ interface State {
   telegramOffset: number
 }
 
+export const defaultDataFile = './data/kerbcue.json'
+
+/** Unset or blank uses the default path. `memory` keeps the store in RAM. */
+export function dataFileFromEnv(value = process.env.KERBCUE_DATA_FILE): string | undefined {
+  const trimmed = value?.trim()
+  if (!trimmed) return defaultDataFile
+  if (/^memory$/i.test(trimmed)) return undefined
+  return trimmed
+}
+
 export class JobStore {
   private state: State = { jobs: new Map(), couriers: new Map(), devices: new Map(), telegramOffset: 0 }
   private readonly pendingLinks = new Map<string, { keyHash: string; expiresAt: number }>()
@@ -200,8 +210,11 @@ export class JobStore {
       try {
         renameSync(dataFile, kept)
         console.warn(`Kerbcue job data is corrupt. Moved it to ${kept} and started with an empty job store.`)
-      } catch {
-        console.warn('Kerbcue job data is corrupt and could not be moved. Starting with an empty job store.')
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : 'unknown error'
+        throw new Error(
+          `Kerbcue job data is corrupt at ${dataFile} and could not be moved aside (${reason}). Refusing to start so the file is not overwritten.`,
+        )
       }
     }
   }

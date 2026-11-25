@@ -25,7 +25,7 @@ interface ApiOptions {
   /** Bot username for t.me deep links. */
   botUsername?: string
   router?: Router
-  /** When set with a bot, claims re-check that the courier is still in this group. */
+  /** When set with a bot, job lists, claims and status updates re-check group membership. */
   groupId?: string
   publicOrigin: string
   demo: boolean
@@ -127,12 +127,22 @@ export function createApi({
       if (!courier) throw new HttpError(401, 'Link this device to Telegram first.')
       return courier
     }
+    // Cached for five minutes. Only a definite "not a member" blocks, not a Telegram outage.
+    const requireGroupMember = async (courier: Courier): Promise<void> => {
+      const telegramUserId = /^tg:(\d+)$/.exec(courier.id)?.[1]
+      if (!telegram || !groupId || !telegramUserId) return
+      if (await telegram.memberRole(groupId, Number(telegramUserId)) === 'none') {
+        jobs.unlinkCourier(courier.id)
+        throw new HttpError(403, 'This Telegram account is no longer in the dispatch group.')
+      }
+    }
 
     try {
       const { pathname } = new URL(request.url)
       if (pathname === '/jobs' && request.method === 'GET') {
         const courier = jobs.courierFor(deviceKey) ?? null
-        // Addresses are only for linked couriers. Unlinked devices just get their link status.
+        // Addresses are only for linked couriers still in the group. Unlinked devices just get their link status.
+        if (courier) await requireGroupMember(courier)
         return json({
           jobs: courier ? jobs.listOpen() : [],
           active: courier ? jobs.listActive(courier.id) : [],
@@ -179,12 +189,7 @@ export function createApi({
       const claimPath = /^\/jobs\/([a-z\d-]+)\/claim$/i.exec(pathname)
       if (claimPath && request.method === 'POST') {
         const courier = requireCourier()
-        const telegramUserId = /^tg:(\d+)$/.exec(courier.id)?.[1]
-        // Cached for five minutes. Only a definite "not a member" blocks, not a Telegram outage.
-        if (telegram && groupId && telegramUserId
-          && await telegram.memberRole(groupId, Number(telegramUserId)) === 'none') {
-          throw new HttpError(403, 'This Telegram account is no longer in the dispatch group.')
-        }
+        await requireGroupMember(courier)
         const id = claimPath[1]
         const pendingBefore = jobs.get(id)?.syncPending === true
         const result = jobs.claim(id, courier)
@@ -207,6 +212,7 @@ export function createApi({
       const statusPath = /^\/jobs\/([a-z\d-]+)\/status$/i.exec(pathname)
       if (statusPath && request.method === 'POST') {
         const courier = requireCourier()
+        await requireGroupMember(courier)
         const body = await readJson(request)
         if (body.status !== 'picked_up' && body.status !== 'delivered') {
           throw new HttpError(400, 'Status must be picked_up or delivered.')

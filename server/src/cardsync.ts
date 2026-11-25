@@ -27,7 +27,11 @@ export class CardSync {
     const previous = this.chains.get(id) ?? Promise.resolve(true)
     const run = previous.catch(() => false).then(() => this.syncLatest(id))
     this.chains.set(id, run)
-    void run.finally(() => {
+    // Catch on the cleanup chain so a rejected sync cannot become an unhandled rejection,
+    // including when a caller uses `void sync()`. The returned `run` still rejects for awaiters.
+    void run.catch(error => {
+      console.error('Kerbcue could not finish a Telegram card sync.', error)
+    }).finally(() => {
       if (this.chains.get(id) === run) this.chains.delete(id)
     })
     return run

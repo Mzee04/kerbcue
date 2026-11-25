@@ -1,16 +1,19 @@
 import { setTimeout as delay } from 'node:timers/promises'
 import { Agent, fetch } from 'undici'
-import type { ClaimedJob, OpenJob } from '../../shared/jobs.ts'
-import { newJob, parseJob, type JobStore, type TelegramCard } from './jobs.ts'
+import { distanceLine, type AssignedJob, type Job, type OpenJob } from '../../shared/jobs.ts'
+import { courierNameOf, coordinatesOf, newJob, parseJob, type JobStore, type TelegramCard } from './jobs.ts'
+import type { Router } from './routing.ts'
 
 interface TelegramMessage {
   message_id: number
   message_thread_id?: number
   is_topic_message?: boolean
   chat: { id: number; type: string }
-  from?: { id?: number; is_bot?: boolean }
+  from?: { id?: number; is_bot?: boolean; first_name?: string; last_name?: string; username?: string }
   sender_chat?: { id: number }
   text?: string
+  location?: { latitude: number; longitude: number }
+  reply_to_message?: { message_id: number }
 }
 
 interface TelegramUpdate {
@@ -18,7 +21,7 @@ interface TelegramUpdate {
   message?: TelegramMessage
 }
 
-type TelegramMethod = 'getUpdates' | 'sendMessage' | 'editMessageText'
+type TelegramMethod = 'getUpdates' | 'sendMessage' | 'editMessageText' | 'getMe' | 'getChatMember'
 type TelegramReply<T> = { ok: true; result: T } | {
   ok: false
   error_code?: number
@@ -59,17 +62,31 @@ function requestErrorReason(error: unknown): string {
   return 'Network error'
 }
 
-function cardText(job: OpenJob | ClaimedJob): string {
-  const status = job.status === 'open'
-    ? 'Open'
-    : `Claimed by ${job.courierName} at ${job.claimedAt.slice(0, 16).replace('T', ' ')} UTC`
+function utcTime(iso: string): string {
+  return iso.slice(11, 16) + ' UTC'
+}
+
+export function cardText(job: Job): string {
+  const status = job.status === 'open' ? 'Available'
+    : job.status === 'claimed' ? `Claimed by ${job.courierName}`
+      : job.status === 'picked_up' ? `Picked up by ${job.courierName}`
+        : `Delivered by ${job.courierName}`
+  const distance = distanceLine(job)
+  const history = job.status === 'open' ? [] : [
+    '',
+    `Claimed ${job.claimedAt.slice(0, 10)} ${utcTime(job.claimedAt)}`,
+    ...(job.pickedUpAt ? [`Picked up ${utcTime(job.pickedUpAt)}`] : []),
+    ...(job.deliveredAt ? [`Delivered ${utcTime(job.deliveredAt)}`] : []),
+  ]
   return [
     `Kerbcue job ${job.id}`,
-    status,
+    `Status: ${status}`,
     `Pickup: ${job.pickup}`,
     `Drop: ${job.drop}`,
+    ...(distance ? [`Distance: ${distance}`] : []),
     `Pay: ${job.pay}`,
     ...(job.note ? [`Note: ${job.note}`] : []),
+    ...history,
   ].join('\n')
 }
 
@@ -147,6 +164,32 @@ export class TelegramClient {
     return updates
   }
 
+  /** The bot username, used to build t.me deep links for courier linking. */
+  async getUsername(): Promise<string | undefined> {
+    try {
+      const me = await this.call<{ username?: unknown }>('getMe', {})
+      return typeof me.username === 'string' && /^[a-z\d_]{3,64}$/i.test(me.username) ? me.username : undefined
+    } catch (error) {
+      reportTelegramFailure(error)
+      return undefined
+    }
+  }
+
+  async isGroupMember(chatId: string, userId: number): Promise<boolean> {
+    try {
+      const member = await this.call<{ status?: string; is_member?: boolean }>('getChatMember', { chat_id: chatId, user_id: userId })
+      return ['creator', 'administrator', 'member'].includes(member.status ?? '')
+        || (member.status === 'restricted' && member.is_member === true)
+    } catch (error) {
+      reportTelegramFailure(error)
+      return false
+    }
+  }
+
+  sendText(chatId: string | number, text: string, signal?: AbortSignal): Promise<TelegramMessage> {
+    return this.call('sendMessage', { chat_id: chatId, text }, signal)
+  }
+
   sendOpenCard(chatId: string, job: OpenJob, threadId?: number, signal?: AbortSignal): Promise<TelegramMessage> {
     return this.call('sendMessage', {
       chat_id: chatId,
@@ -155,11 +198,15 @@ export class TelegramClient {
     }, signal)
   }
 
-  private async notifyClaim(method: 'editMessageText' | 'sendMessage', body: object): Promise<unknown> {
+  private async notify(method: 'editMessageText' | 'sendMessage', body: object): Promise<unknown> {
     try {
       return await this.call(method, body)
     } catch (error) {
       const rejection = error instanceof TelegramError ? error.rejection : undefined
+      // Telegram rejects an edit that would not change the text. The card is already right.
+      if (method === 'editMessageText' && error instanceof TelegramError && /message is not modified/i.test(error.message)) {
+        return true
+      }
       const status = rejection?.status
       const retryAfter = rejection?.retryAfter
       const wait = status === 429 && retryAfter !== undefined
@@ -171,14 +218,18 @@ export class TelegramClient {
     }
   }
 
-  async syncClaim(card: TelegramCard, job: ClaimedJob): Promise<boolean> {
+  private editCard(card: TelegramCard, job: Job): Promise<unknown> {
+    return this.notify('editMessageText', {
+      chat_id: card.telegramChatId,
+      message_id: card.telegramMessageId,
+      text: cardText(job),
+    })
+  }
+
+  async syncClaim(card: TelegramCard, job: AssignedJob): Promise<boolean> {
     const [edit, reply] = await Promise.all([
-      this.notifyClaim('editMessageText', {
-        chat_id: card.telegramChatId,
-        message_id: card.telegramMessageId,
-        text: cardText(job),
-      }).catch(reportTelegramFailure),
-      this.notifyClaim('sendMessage', {
+      this.editCard(card, job).catch(reportTelegramFailure),
+      this.notify('sendMessage', {
         chat_id: card.telegramChatId,
         message_thread_id: card.telegramThreadId,
         reply_parameters: { message_id: card.telegramMessageId, allow_sending_without_reply: true },
@@ -188,11 +239,63 @@ export class TelegramClient {
 
     return edit !== null && reply !== null
   }
+
+  /** Status changes and new pins edit the original card in place. No new group messages. */
+  async syncCard(card: TelegramCard, job: Job): Promise<boolean> {
+    return await this.editCard(card, job).catch(reportTelegramFailure) !== null
+  }
 }
 
 function reportTelegramFailure(error: unknown): null {
   console.error(error instanceof TelegramError ? error.message : 'Telegram update failed.')
   return null
+}
+
+function courierNameFrom(from: NonNullable<TelegramMessage['from']>): string {
+  const full = courierNameOf([from.first_name, from.last_name].filter(Boolean).join(' '))
+  return full ?? courierNameOf(from.username ? `@${from.username}` : undefined) ?? `Courier ${from.id}`
+}
+
+/** A courier sends /start CODE to the bot in a private chat to link their glasses. */
+async function linkCourier(
+  telegram: TelegramClient,
+  jobs: JobStore,
+  groupId: string | undefined,
+  message: TelegramMessage,
+  signal?: AbortSignal,
+): Promise<void> {
+  const match = /^\/start(?:@[a-z\d_]+)?(?:\s+([A-Za-z\d]{4,16}))?\s*$/i.exec(message.text?.trim() ?? '')
+  if (!match || !message.from?.id || message.from.is_bot) return
+  const reply = (text: string) => telegram.sendText(message.chat.id, text, signal).catch(reportTelegramFailure)
+  if (!match[1]) {
+    await reply('Open Kerbcue on your glasses. It shows a link code. Send /start CODE here to link them.')
+    return
+  }
+  if (!groupId || !await telegram.isGroupMember(groupId, message.from.id)) {
+    await reply('Only members of the dispatch group can link Kerbcue glasses.')
+    return
+  }
+  const name = courierNameFrom(message.from)
+  const result = jobs.completeLink(match[1], { id: `tg:${message.from.id}`, name })
+  await reply(result === 'linked'
+    ? `Linked. Your Kerbcue claims will show as ${name}.`
+    : 'That code has expired or was already used. Reopen Kerbcue on your glasses for a new code.')
+}
+
+async function routeAndSync(telegram: TelegramClient, jobs: JobStore, id: string, router?: Router): Promise<void> {
+  let stored = jobs.get(id)
+  const job = stored?.job
+  if (router && job?.pickupAt && job.dropAt && !job.route) {
+    const route = await router(job.pickupAt, job.dropAt)
+    if (route) stored = jobs.setRoute(id, route) ?? stored
+  }
+  if (stored?.card) await telegram.syncCard(stored.card, stored.job)
+}
+
+export interface IngestOptions {
+  signal?: AbortSignal
+  dispatcherIds?: ReadonlySet<string>
+  router?: Router
 }
 
 export async function ingestUpdate(
@@ -201,10 +304,13 @@ export async function ingestUpdate(
   groupId: string | undefined,
   update: TelegramUpdate,
   seenGroups: Set<string>,
-  signal?: AbortSignal,
-  dispatcherIds?: ReadonlySet<string>,
+  { signal, dispatcherIds, router }: IngestOptions = {},
 ): Promise<void> {
   const message = update.message
+  if (message?.chat.type === 'private') {
+    await linkCourier(telegram, jobs, groupId, message, signal)
+    return
+  }
   if (!message || !['group', 'supergroup'].includes(message.chat.type)) return
 
   const chatId = String(message.chat.id)
@@ -213,14 +319,27 @@ export async function ingestUpdate(
     console.log(`Telegram group chat ID: ${chatId}`)
   }
   const isAnonymousAdmin = message.sender_chat?.id === message.chat.id
-  if (chatId !== groupId || (message.from?.is_bot && !isAnonymousAdmin) || !message.text) return
+  if (chatId !== groupId || (message.from?.is_bot && !isAnonymousAdmin)) return
   const requireDispatcher = dispatcherIds !== undefined && !isAnonymousAdmin
   if (requireDispatcher && !dispatcherIds.has(String(message.from?.id))) return
+
+  // A location pin sent as a reply to a job card sets pickup, then drop.
+  if (message.location && message.reply_to_message) {
+    const target = jobs.findByCard(chatId, message.reply_to_message.message_id)
+    const at = coordinatesOf({ lat: message.location.latitude, lng: message.location.longitude })
+    if (target && at && jobs.addPin(target.job.id, at)) await routeAndSync(telegram, jobs, target.job.id, router)
+    return
+  }
+  if (!message.text) return
 
   const details = parseJob(message.text, requireDispatcher)
   if (!details) return
 
-  const job = newJob(details)
+  let job = newJob(details)
+  if (router && job.pickupAt && job.dropAt) {
+    const route = await router(job.pickupAt, job.dropAt)
+    if (route) job = { ...job, route }
+  }
   const threadId = message.is_topic_message ? message.message_thread_id : undefined
   const nextOffset = update.update_id + 1
   const maxRetries = 3
@@ -258,6 +377,7 @@ export async function pollTelegram(
   groupId: string | undefined,
   signal: AbortSignal,
   dispatcherIds?: ReadonlySet<string>,
+  router?: Router,
 ): Promise<void> {
   let offset = jobs.getTelegramOffset()
   let failures = 0
@@ -286,7 +406,7 @@ export async function pollTelegram(
       if (update.update_id < offset) continue
       const nextOffset = update.update_id + 1
       try {
-        await ingestUpdate(telegram, jobs, groupId, update, seenGroups, signal, dispatcherIds)
+        await ingestUpdate(telegram, jobs, groupId, update, seenGroups, { signal, dispatcherIds, router })
         jobs.setTelegramOffset(nextOffset)
       } catch {
         console.error('Kerbcue could not save the Telegram update. Polling stopped.')

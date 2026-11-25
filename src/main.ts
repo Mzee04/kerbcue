@@ -6,7 +6,17 @@ import {
   TextContainerUpgrade,
   OsEventTypeList,
 } from '@evenrealities/even_hub_sdk'
-import type { ClaimedJob, JobDetails, OpenJob } from '../shared/jobs.ts'
+import {
+  distanceLine,
+  nextStatus,
+  type AssignedJob,
+  type Courier,
+  type CourierStatus,
+  type JobDetails,
+  type LinkResponse,
+  type OpenJob,
+  type RouteEstimate,
+} from '../shared/jobs.ts'
 import { createJobsClient } from './api.ts'
 
 const mainContainer = { containerID: 1, containerName: 'main' }
@@ -27,13 +37,41 @@ function shorten(value: string, limit = 24): string {
   return chars.length > limit ? chars.slice(0, limit - 3).join('') + '...' : value
 }
 
-function deliveryLines(job: JobDetails): string[] {
-  return [`Pickup: ${shorten(job.pickup)}`, `Drop: ${shorten(job.drop)}`, `Pay: ${shorten(job.pay)}`]
+function deliveryLines(job: JobDetails & { route?: RouteEstimate }): string[] {
+  const distance = distanceLine(job)
+  return [
+    `Pickup: ${shorten(job.pickup)}`,
+    `Drop: ${shorten(job.drop)}`,
+    `Pay: ${shorten(job.pay)}`,
+    ...(distance ? [shorten(distance, 30)] : []),
+  ]
 }
+
+// Each device keeps its own link. `?courier=b` gives a second simulator its own slot for demos.
+const linkSlot = new URLSearchParams(window.location.search).get('courier')?.replace(/[^a-z\d]/gi, '').slice(0, 12)
+const linkStorageKey = `kerbcue-link${linkSlot ? `-${linkSlot}` : ''}`
+
+type Action = { kind: 'claim'; job: OpenJob } | { kind: 'advance'; job: AssignedJob; to: CourierStatus }
 
 interface Frame {
   text: string
-  job?: OpenJob
+  action?: Action
+  linkUrl?: string
+}
+
+function sameAction(a?: Action, b?: Action): boolean {
+  return a?.kind === b?.kind && a?.job.id === b?.job.id && a?.job.status === b?.job.status
+}
+
+function renderCompanion(frame: Frame): void {
+  if (!companion) return
+  companion.textContent = frame.text
+  if (frame.linkUrl) {
+    const anchor = document.createElement('a')
+    anchor.href = frame.linkUrl
+    anchor.textContent = '\n\nOpen Telegram to link'
+    companion.append(anchor)
+  }
 }
 
 function pageLayout(content: string) {
@@ -75,53 +113,98 @@ async function start(): Promise<void> {
   } catch {
     // Some WebView origins disallow storage.
   }
+  let link: LinkResponse | undefined
+  const linkStore = {
+    async load(): Promise<LinkResponse | undefined> {
+      let raw = ''
+      try {
+        // Do not let a slow host bridge block startup.
+        raw = await Promise.race([
+          bridge.getLocalStorage(linkStorageKey),
+          new Promise<string>(resolve => window.setTimeout(() => resolve(''), 1500)),
+        ]) ?? ''
+      } catch { /* Fall back to the WebView. */ }
+      try { raw ||= window.localStorage.getItem(linkStorageKey) ?? '' } catch { /* Storage can be blocked. */ }
+      try {
+        const saved = JSON.parse(raw) as Partial<LinkResponse>
+        return typeof saved.deviceKey === 'string' && typeof saved.code === 'string' ? saved as LinkResponse : undefined
+      } catch {
+        return undefined
+      }
+    },
+    async save(value: LinkResponse): Promise<void> {
+      const raw = JSON.stringify(value)
+      await bridge.setLocalStorage(linkStorageKey, raw).catch(() => false)
+      try { window.localStorage.setItem(linkStorageKey, raw) } catch { /* Kept in memory for this session. */ }
+    },
+  }
+  link = await linkStore.load()
+
   let api: ReturnType<typeof createJobsClient> | undefined
   try {
-    api = createJobsClient(lifetime.signal)
+    api = createJobsClient(lifetime.signal, () => link?.deviceKey)
   } catch {
     console.error('Set the backend origin in app.json.')
   }
 
   let jobs: OpenJob[] = []
+  let active: AssignedJob[] = []
   let index = 0
-  let courierName = ''
+  let courier: Courier | null = null
   let loaded = false
   let offline = false
-  let claiming: OpenJob | undefined
-  let confirmation: { job: ClaimedJob; until: number } | undefined
+  let linking = false
+  let busy: Action | undefined
+  let confirmation: { text: string; until: number } | undefined
   let notice: { text: string; until: number } | undefined
   let painting = false
   let refreshVersion = 0
   let refreshing = false
 
   function frame(): Frame {
-    const message = notice && notice.until > Date.now() ? notice.text : undefined
-    if (confirmation && confirmation.until > Date.now()) {
+    const now = Date.now()
+    const message = notice && notice.until > now ? notice.text : undefined
+    if (confirmation && confirmation.until > now) return { text: confirmation.text }
+
+    if (!api || !loaded) {
+      const status = !api ? 'Check backend setup' : offline ? 'Offline. Retrying...' : 'Loading jobs...'
+      return { text: ['Kerbcue', '', status, '', exitHint].join('\n') }
+    }
+
+    if (!courier) {
+      const bot = link?.link ? `@${new URL(link.link).pathname.slice(1)}` : 'the Kerbcue bot'
+      const lines = link && !linking
+        ? ['Link your Telegram', `Send /start ${link.code}`, `to ${bot}`]
+        : [offline ? 'Offline. Retrying...' : 'Getting a link code...']
+      return { text: ['Kerbcue', '', ...lines, '', exitHint].join('\n'), linkUrl: link?.link }
+    }
+
+    // A claimed job stays on screen until it is delivered.
+    const current = busy?.kind === 'advance' ? busy.job : busy ? undefined : active[0]
+    if (current) {
+      const to = nextStatus[current.status]
+      const state = current.status === 'claimed' ? `Claimed by ${shorten(current.courierName, 18)}` : 'Picked up'
+      const hint = busy ? 'Saving...'
+        : message ?? (offline ? 'Offline. Retrying...' : to === 'picked_up' ? 'Tap: mark picked up' : 'Tap: mark delivered')
       return {
-        text: ['Kerbcue', '', ...deliveryLines(confirmation.job), '',
-          `Claimed by ${shorten(confirmation.job.courierName, 19)}`,
-          ...(jobs.length ? ['Swipe for next job'] : []),
-        ].join('\n'),
+        action: busy || !to ? undefined : { kind: 'advance', job: current, to },
+        text: ['Kerbcue  My job', ...deliveryLines(current), '', state, hint].join('\n'),
       }
     }
 
-    const job = claiming ?? jobs[index]
+    const job = busy?.kind === 'claim' ? busy.job : jobs[index]
     if (!job) {
-      const status = !api ? 'Check backend setup'
-        : offline ? 'Offline. Retrying...'
-          : loaded ? 'No open jobs' : 'Loading jobs...'
+      const status = offline ? 'Offline. Retrying...' : 'No open jobs'
       return { text: ['Kerbcue', '', status, ...(message ? [message] : []), '', exitHint].join('\n') }
     }
 
-    const title = claiming ? 'Kerbcue' : `Kerbcue  ${index + 1}/${jobs.length}`
-    const status = claiming ? 'Claiming...' : 'Open | Tap to claim'
-    const hint = !claiming && (message || (offline ? 'Offline. Retrying...' : undefined)
+    const title = busy ? 'Kerbcue' : `Kerbcue  ${index + 1}/${jobs.length}`
+    const status = busy ? 'Claiming...' : 'Open | Tap to claim'
+    const hint = !busy && (message || (offline ? 'Offline. Retrying...' : undefined)
       || (jobs.length > 1 ? 'Swipe to browse' : undefined))
     return {
-      job: claiming ? undefined : job,
-      text: [title, '', ...deliveryLines(job), '',
-        status, ...(hint ? [hint] : []),
-      ].join('\n'),
+      action: busy ? undefined : { kind: 'claim', job },
+      text: [title, ...deliveryLines(job), '', status, ...(hint ? [hint] : [])].join('\n'),
     }
   }
 
@@ -131,7 +214,7 @@ async function start(): Promise<void> {
     try {
       while (!stopped()) {
         const next = frame()
-        if (companion) companion.textContent = next.text
+        renderCompanion(next)
         if (displayed?.text !== next.text) {
           const updated = displayed && await bridge.textContainerUpgrade(new TextContainerUpgrade({
             ...mainContainer,
@@ -145,7 +228,7 @@ async function start(): Promise<void> {
               .catch(() => false)
             if (stopped()) return
             if (!rebuilt) {
-              if (claiming) return
+              if (busy) return
               if (session && !session.getItem(displayReloadKey)) {
                 // A fresh launch can create the native page when no page remains to rebuild.
                 session.setItem(displayReloadKey, '1')
@@ -161,7 +244,7 @@ async function start(): Promise<void> {
         if (stopped()) return
         displayed = next
         const latest = frame()
-        if (latest.text === next.text && latest.job?.id === next.job?.id) return
+        if (latest.text === next.text && sameAction(latest.action, next.action)) return
       }
     } catch {
       if (!stopped()) console.warn('Could not update the glasses display.')
@@ -177,19 +260,35 @@ async function start(): Promise<void> {
     jobs = next
   }
 
+  async function startLink(): Promise<void> {
+    if (!api || linking || stopped()) return
+    linking = true
+    try {
+      link = await api.link()
+      await linkStore.save(link)
+    } catch {
+      if (!stopped()) offline = true
+    } finally {
+      linking = false
+    }
+  }
+
   async function refresh(force = false): Promise<void> {
-    if (!api || stopped() || claiming || (refreshing && !force)) return
+    if (!api || stopped() || busy || (refreshing && !force)) return
     const version = ++refreshVersion
     refreshing = true
     try {
       const response = await api.list()
-      if (stopped() || claiming || version !== refreshVersion) return
+      if (stopped() || busy || version !== refreshVersion) return
       setJobs(response.jobs)
-      courierName = response.courierName
+      active = response.active
+      courier = response.courier
       loaded = true
       offline = false
+      // No link yet, or the code expired before the courier sent /start.
+      if (!courier && !response.linkPending) await startLink()
     } catch {
-      if (!stopped() && !claiming && version === refreshVersion) offline = true
+      if (!stopped() && !busy && version === refreshVersion) offline = true
     } finally {
       if (version === refreshVersion) refreshing = false
       void paint()
@@ -197,7 +296,7 @@ async function start(): Promise<void> {
   }
 
   function browse(direction: number): void {
-    if (stopped() || claiming || jobs.length === 0) return
+    if (stopped() || busy || jobs.length === 0 || active.length > 0) return
     if (confirmation && confirmation.until > Date.now()) {
       confirmation = undefined
     } else {
@@ -207,31 +306,62 @@ async function start(): Promise<void> {
     void paint()
   }
 
-  async function claimVisibleJob(): Promise<void> {
-    const job = displayed?.job
-    if (!api || stopped() || claiming || !job) return
-    claiming = job
+  async function claim(job: OpenJob): Promise<void> {
+    if (!api) return
+    const result = await api.claim(job.id)
+    if (stopped()) return
+    setJobs(jobs.filter(open => open.id !== job.id))
+    if (result === 'conflict') {
+      notice = { text: 'Job already taken', until: Date.now() + 4000 }
+    } else if (result === 'unlinked') {
+      courier = null
+    } else {
+      active = [result.job, ...active.filter(mine => mine.id !== job.id)]
+      if (result.telegramSynced === true) console.info('Telegram card updated and reply posted.')
+      if (result.telegramSynced === false) console.warn('The job was claimed, but Telegram updates failed.')
+    }
+  }
+
+  async function advance(job: AssignedJob, to: CourierStatus): Promise<void> {
+    if (!api) return
+    const result = await api.advance(job.id, to)
+    if (stopped()) return
+    if ('conflict' in result) {
+      notice = { text: 'Already updated', until: Date.now() + 4000 }
+    } else if ('forbidden' in result) {
+      notice = { text: 'Not your job', until: Date.now() + 4000 }
+    } else {
+      const updated = result.job
+      active = updated.status === 'delivered'
+        ? active.filter(mine => mine.id !== updated.id)
+        : active.map(mine => mine.id === updated.id ? updated : mine)
+      if (updated.status === 'delivered') {
+        confirmation = {
+          text: ['Kerbcue', '', 'Delivered', shorten(updated.drop), '', 'Dispatcher notified'].join('\n'),
+          until: Date.now() + 4000,
+        }
+      }
+      if (result.telegramSynced === false) console.warn('The status was saved, but the Telegram card update failed.')
+    }
+  }
+
+  async function act(): Promise<void> {
+    const action = displayed?.action
+    if (!api || stopped() || busy || !action) return
+    busy = action
     notice = undefined
     void paint()
-    let refreshNow = false
     try {
-      const result = await api.claim(job.id, courierName)
-      if (stopped()) return
-      setJobs(jobs.filter(open => open.id !== job.id))
-      if (result === 'conflict') {
-        notice = { text: 'Job already taken', until: Date.now() + 4000 }
-      } else {
-        confirmation = { job: result.job, until: Date.now() + 4500 }
-        if (result.telegramSynced === true) console.info('Telegram card updated and reply posted.')
-        if (result.telegramSynced === false) console.warn('The job was claimed, but Telegram updates failed.')
-      }
-      refreshNow = true
+      if (action.kind === 'claim') await claim(action.job)
+      else await advance(action.job, action.to)
     } catch {
-      if (!stopped()) notice = { text: 'Claim failed. Retry.', until: Date.now() + 4500 }
+      if (!stopped()) {
+        notice = { text: action.kind === 'claim' ? 'Claim failed. Retry.' : 'Update failed. Retry.', until: Date.now() + 4500 }
+      }
     } finally {
-      claiming = undefined
+      busy = undefined
       void paint()
-      if (refreshNow) void refresh(true)
+      void refresh(true)
     }
   }
 
@@ -263,7 +393,7 @@ async function start(): Promise<void> {
       return
     }
     // Right temple, left temple, R1 and simulator taps use the same action.
-    if (has(OsEventTypeList.CLICK_EVENT)) void claimVisibleJob()
+    if (has(OsEventTypeList.CLICK_EVENT)) void act()
   })
 
   if (companion instanceof HTMLElement) companion.style.whiteSpace = 'pre-line'

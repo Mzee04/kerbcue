@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import type { ClaimedJob, ClaimResponse, OpenJob, OpenJobsResponse } from '../../shared/jobs.ts'
+import type { AssignedJob, ClaimResponse, OpenJob, OpenJobsResponse } from '../../shared/jobs.ts'
 import { createApi } from '../src/api.ts'
 import { JobStore, newJob, parseJob } from '../src/jobs.ts'
 import { pollTelegram, TelegramClient } from '../src/telegram.ts'
@@ -18,16 +18,27 @@ const details = {
   note: 'leave at reception',
 }
 const card = { telegramChatId: groupId, telegramMessageId: 42, telegramThreadId: 19 }
-const claimedJob: ClaimedJob = {
-  ...details, id: 'test-claim', status: 'claimed', courierName: 'Alex', claimedAt: '2026-11-23T08:00:00.000Z',
+const alex = { id: 'tg:1001', name: 'Alex' }
+const bola = { id: 'tg:1002', name: 'Bola' }
+const claimedJob: AssignedJob = {
+  ...details, id: 'test-claim', status: 'claimed', courierId: alex.id, courierName: 'Alex', claimedAt: '2026-11-23T08:00:00.000Z',
 }
 
-function request(path: string, body?: unknown): Request {
-  return new Request(`http://localhost:8787${path}`, body === undefined ? {} : {
+function request(path: string, body?: unknown, deviceKey?: string): Request {
+  const auth: Record<string, string> = deviceKey ? { Authorization: `Bearer ${deviceKey}` } : {}
+  return new Request(`http://localhost:8787${path}`, body === undefined ? { headers: auth } : {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Origin: webOrigin },
+    headers: { 'Content-Type': 'application/json', Origin: webOrigin, ...auth },
     body: JSON.stringify(body),
   })
+}
+
+/** Links a device the way a Telegram /start CODE would, and returns its device key. */
+function linkDevice(jobs: JobStore, courier: { id: string; name: string }): string {
+  const link = jobs.createLink()
+  assert.ok(link)
+  assert.equal(jobs.completeLink(link.code, courier), 'linked')
+  return link.deviceKey
 }
 
 function makeUpdate(update_id: number, chatId: string, text: string, senderChatId?: number, userId?: number) {
@@ -120,7 +131,7 @@ test('polls only the configured group and replies to the canonical Telegram card
     return Response.json({ ok: true, result: { message_id: 42 } })
   })
 
-  const api = createApi({ jobs, telegram, courierName: 'Courier', publicOrigin: webOrigin, demo: false })
+  const api = createApi({ jobs, telegram, publicOrigin: webOrigin, demo: false })
   await pollTelegram(telegram, jobs, groupId, stop.signal)
   assert.deepEqual(calls.map(({ method }) => method), ['getUpdates', 'sendMessage', 'getUpdates'])
   assert.deepEqual(calls[2].body, { offset: 103, timeout: 25, allowed_updates: ['message'] })
@@ -132,15 +143,17 @@ test('polls only the configured group and replies to the canonical Telegram card
   assert.deepEqual(job, { ...details, id: job.id, status: 'open' })
   assert.equal(calls[1].body.chat_id, groupId)
   assert.equal(calls[1].body.message_thread_id, 19)
-  assert.match(String(calls[1].body.text), /Open\nPickup: Central Station/)
+  assert.match(String(calls[1].body.text), /Status: Available\nPickup: Central Station/)
   assert.ok(String(calls[1].body.text).includes(job.id))
   assert.equal((await api(request('/jobs', {}))).status, 404)
 
   const claimPath = `/jobs/${job.id}/claim`
-  const first = api(request(claimPath, { courierName: 'Alex' }))
+  const alexKey = linkDevice(jobs, alex)
+  const bolaKey = linkDevice(jobs, bola)
+  const first = api(request(claimPath, {}, alexKey))
   try {
     await Promise.all([editStarted.promise, replyStarted.promise])
-    assert.equal((await api(request(claimPath, { courierName: 'Second courier' }))).status, 409)
+    assert.equal((await api(request(claimPath, {}, bolaKey))).status, 409)
     assert.deepEqual((await (await api(request('/jobs'))).json()).jobs, [])
   } finally {
     finishEdit.resolve()
@@ -159,7 +172,8 @@ test('polls only the configured group and replies to the canonical Telegram card
   assert.ok(edit && reply)
   assert.equal(edit.body.chat_id, groupId)
   assert.equal(edit.body.message_id, 42)
-  assert.match(String(edit.body.text), /Claimed by Alex at \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC/)
+  assert.match(String(edit.body.text), /Status: Claimed by Alex\n/)
+  assert.match(String(edit.body.text), /Claimed \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC/)
   assert.deepEqual(reply.body, {
     chat_id: groupId,
     message_thread_id: 19,
@@ -186,8 +200,8 @@ test('keeps a card-less job and confirms the update after an uncertain network f
   assert.deepEqual(warnings.mock.calls.map(call => call.arguments), [
     [`Kerbcue job ${job.id} added without a Telegram card.`],
   ])
-  const api = createApi({ jobs, courierName: 'Courier', publicOrigin: webOrigin, demo: false })
-  const claimed = await api(request(`/jobs/${job.id}/claim`, {}))
+  const api = createApi({ jobs, publicOrigin: webOrigin, demo: false })
+  const claimed = await api(request(`/jobs/${job.id}/claim`, {}, linkDevice(jobs, alex)))
   assert.equal(claimed.status, 200)
   assert.equal((await claimed.json() as ClaimResponse).telegramSynced, null)
 })
@@ -211,7 +225,7 @@ test('retries a Telegram 429 and stores the posted card once', async t => {
   assert.match(errors.mock.calls[0].arguments[0], /HTTP 429, Too Many Requests/)
   const open = jobs.listOpen()
   assert.equal(open.length, 1)
-  const result = jobs.claim(open[0].id, 'Alex')
+  const result = jobs.claim(open[0].id, alex)
   assert.equal(result.status, 'claimed')
   assert.deepEqual(result.card, { telegramChatId: groupId, telegramMessageId: 73, telegramThreadId: 19 })
 })
@@ -283,14 +297,14 @@ test('persists open and claimed jobs, Telegram cards, and the polling offset acr
   const first = newJob(details)
   const open = newJob({ ...details, pickup: 'Public Library' })
   initial.add(first, card)
-  const claim = initial.claim(first.id, 'Alex')
+  const claim = initial.claim(first.id, alex)
   assert.equal(claim.status, 'claimed')
   initial.add(open)
   initial.setTelegramOffset(81)
 
   const restarted = new JobStore(dataFile)
   assert.deepEqual(restarted.listOpen(), [open])
-  assert.deepEqual(restarted.claim(first.id, 'Alex'), { ...claim, status: 'already' })
+  assert.deepEqual(restarted.claim(first.id, alex), { ...claim, status: 'already' })
   assert.equal(restarted.getTelegramOffset(), 81)
 
   let posts = 0
@@ -308,7 +322,7 @@ test('persists open and claimed jobs, Telegram cards, and the polling offset acr
   const latest = new JobStore(dataFile)
   assert.equal(latest.getTelegramOffset(), 83)
   assert.deepEqual(latest.listOpen().map(job => job.pickup), ['Public Library', 'Central Station'])
-  assert.deepEqual(latest.claim(first.id, 'Alex'), { ...claim, status: 'already' })
+  assert.deepEqual(latest.claim(first.id, alex), { ...claim, status: 'already' })
 })
 
 test('starts empty and logs once for a corrupt data file', t => {
@@ -333,17 +347,22 @@ test('returns the existing claim to the same courier and rejects any other couri
     calls += 1
     return Response.json({ ok: true, result: { message_id: 42 } })
   })
-  const api = createApi({ jobs, telegram, courierName: 'Courier', publicOrigin: webOrigin, demo: false })
+  const api = createApi({ jobs, telegram, publicOrigin: webOrigin, demo: false })
   const claimPath = `/jobs/${job.id}/claim`
-  const first = await api(request(claimPath, { courierName: 'Alex' }))
+  const alexKey = linkDevice(jobs, alex)
+  // A second pair of glasses linked to the same Telegram account is the same courier.
+  const alexSpareKey = linkDevice(jobs, alex)
+  const first = await api(request(claimPath, {}, alexKey))
   assert.equal(first.status, 200)
   const claimed = await first.json() as ClaimResponse
   assert.equal(claimed.telegramSynced, true)
 
-  const repeat = await api(request(claimPath, { courierName: 'Alex' }))
+  const repeat = await api(request(claimPath, {}, alexSpareKey))
   assert.equal(repeat.status, 200)
   assert.deepEqual(await repeat.json(), { job: claimed.job, telegramSynced: null })
-  assert.equal((await api(request(claimPath, { courierName: 'Another courier' }))).status, 409)
+  assert.equal((await api(request(claimPath, {}, linkDevice(jobs, bola)))).status, 409)
+  // A client-supplied name cannot override the linked Telegram identity.
+  assert.equal((await api(request(claimPath, { courierName: 'Alex' }, linkDevice(jobs, bola)))).status, 409)
   assert.equal(calls, 2)
 })
 
@@ -405,8 +424,9 @@ test('does not retry a claim reply when a network error leaves delivery uncertai
   assert.equal(replies, 1)
 })
 
-test('creates and claims a token-free demo job with the configured courier and CORS preflight', async () => {
-  const api = createApi({ jobs: new JobStore(), courierName: 'Demo Courier', publicOrigin: webOrigin, demo: true })
+test('creates a demo job, links a demo courier, and claims with CORS preflight', async () => {
+  const jobs = new JobStore()
+  const api = createApi({ jobs, publicOrigin: webOrigin, demo: true })
   const created = await api(request('/jobs', {}))
   assert.equal(created.status, 201)
   const { job } = await created.json() as { job: OpenJob }
@@ -415,18 +435,46 @@ test('creates and claims a token-free demo job with the configured courier and C
 
   const preflight = await api(new Request(`http://localhost:8787${claimPath}`, {
     method: 'OPTIONS',
-    headers: { Origin: webOrigin, 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'Content-Type' },
+    headers: { Origin: webOrigin, 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'Content-Type, Authorization' },
   }))
   assert.equal(preflight.status, 204)
   assert.equal(preflight.headers.get('Access-Control-Allow-Origin'), webOrigin)
   assert.match(preflight.headers.get('Access-Control-Allow-Methods') ?? '', /POST/)
   assert.match(preflight.headers.get('Access-Control-Allow-Headers') ?? '', /Content-Type/i)
-  assert.equal((await api(request(claimPath, { courierName: '' }))).status, 400)
+  assert.match(preflight.headers.get('Access-Control-Allow-Headers') ?? '', /Authorization/i)
 
-  const claimed = await api(request(claimPath, {}))
+  // An unlinked device cannot claim, even with a name in the body.
+  assert.equal((await api(request(claimPath, { courierName: 'Alex' }))).status, 401)
+  const linkResponse = await api(request('/couriers/link', {}))
+  assert.equal(linkResponse.status, 201)
+  const link = await linkResponse.json() as { code: string; deviceKey: string; link?: string }
+  assert.match(link.code, /^[A-Z2-9]{8}$/)
+  assert.equal(link.link, undefined)
+  const pending = await (await api(request('/jobs', undefined, link.deviceKey))).json() as OpenJobsResponse
+  assert.equal(pending.courier, null)
+  assert.equal(pending.linkPending, true)
+  assert.equal((await api(request('/couriers/demo-link', { code: link.code, name: '' }))).status, 400)
+  assert.equal((await api(request('/couriers/demo-link', { code: 'NOPE2345', name: 'Demo Courier' }))).status, 404)
+  assert.equal((await api(request('/couriers/demo-link', { code: link.code, name: 'Demo Courier' }))).status, 200)
+  // A code links one device once.
+  assert.equal((await api(request('/couriers/demo-link', { code: link.code, name: 'Someone Else' }))).status, 404)
+  const linked = await (await api(request('/jobs', undefined, link.deviceKey))).json() as OpenJobsResponse
+  assert.deepEqual(linked.courier, { id: 'demo:demo courier', name: 'Demo Courier' })
+
+  const claimed = await api(request(claimPath, {}, link.deviceKey))
   assert.equal(claimed.status, 200)
   const response = await claimed.json() as ClaimResponse
   assert.equal(response.job.courierName, 'Demo Courier')
   assert.equal(response.telegramSynced, null)
-  assert.equal((await api(request(claimPath, { courierName: 'Another courier' }))).status, 409)
+  const after = await (await api(request('/jobs', undefined, link.deviceKey))).json() as OpenJobsResponse
+  assert.deepEqual(after.jobs, [])
+  assert.deepEqual(after.active.map(mine => mine.id), [job.id])
+})
+
+test('hides demo-only routes when a Telegram bot is configured', async () => {
+  const api = createApi({ jobs: new JobStore(), publicOrigin: webOrigin, demo: false, botUsername: 'kerbcue_bot' })
+  assert.equal((await api(request('/jobs', {}))).status, 404)
+  const link = await (await api(request('/couriers/link', {}))).json() as { code: string; link?: string }
+  assert.equal(link.link, `https://t.me/kerbcue_bot?start=${link.code}`)
+  assert.equal((await api(request('/couriers/demo-link', { code: link.code, name: 'Mallory' }))).status, 404)
 })

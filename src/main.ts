@@ -337,7 +337,9 @@ async function start(): Promise<void> {
         : active.map(mine => mine.id === updated.id ? updated : mine)
       if (updated.status === 'delivered') {
         confirmation = {
-          text: ['Kerbcue', '', 'Delivered', shorten(updated.drop), '', 'Dispatcher notified'].join('\n'),
+          // Only claim the dispatcher saw it when the Telegram card edit succeeded.
+          text: ['Kerbcue', '', 'Delivered', shorten(updated.drop),
+            ...(result.telegramSynced === true ? ['', 'Telegram card updated'] : [])].join('\n'),
           until: Date.now() + 4000,
         }
       }

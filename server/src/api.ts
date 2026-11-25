@@ -9,6 +9,7 @@ import type {
 } from '../../shared/jobs.ts'
 import { courierNameOf, jobDetailsOf, newJob, type JobStore } from './jobs.ts'
 import type { Router } from './routing.ts'
+import { cardSyncFor } from './cardsync.ts'
 import type { TelegramClient } from './telegram.ts'
 
 const demoJob: JobDetails = {
@@ -24,8 +25,31 @@ interface ApiOptions {
   /** Bot username for t.me deep links. */
   botUsername?: string
   router?: Router
+  /** When set with a bot, claims re-check that the courier is still in this group. */
+  groupId?: string
   publicOrigin: string
   demo: boolean
+  /** Link-code limits per client IP and in total, per minute. */
+  linkLimits?: { perIp: number; total: number }
+}
+
+/** Fixed one-minute windows. Enough to stop a script from flooding link codes. */
+function createLinkLimiter({ perIp, total }: { perIp: number; total: number }) {
+  let windowStart = 0
+  let count = 0
+  const perClient = new Map<string, number>()
+  return (ip: string, now = Date.now()): number | undefined => {
+    if (now - windowStart >= 60_000) {
+      windowStart = now
+      count = 0
+      perClient.clear()
+    }
+    const used = perClient.get(ip) ?? 0
+    if (used >= perIp || count >= total) return Math.ceil((windowStart + 60_000 - now) / 1000)
+    perClient.set(ip, used + 1)
+    count += 1
+    return undefined
+  }
 }
 
 class HttpError extends Error {
@@ -77,8 +101,13 @@ function deviceKeyOf(request: Request): string | undefined {
   return match?.[1]
 }
 
-export function createApi({ jobs, telegram, botUsername, router, publicOrigin, demo }: ApiOptions) {
-  return async (request: Request): Promise<Response> => {
+export function createApi({
+  jobs, telegram, botUsername, router, groupId, publicOrigin, demo, linkLimits = { perIp: 10, total: 120 },
+}: ApiOptions) {
+  const limitLinks = createLinkLimiter(linkLimits)
+  const cards = telegram ? cardSyncFor(telegram, jobs) : undefined
+
+  return async (request: Request, client: { ip?: string } = {}): Promise<Response> => {
     const headers = new Headers({ 'Cache-Control': 'no-store' })
     if (publicOrigin !== '*') headers.set('Vary', 'Origin')
     if (publicOrigin === '*' || request.headers.get('Origin') === publicOrigin) {
@@ -103,8 +132,9 @@ export function createApi({ jobs, telegram, botUsername, router, publicOrigin, d
       const { pathname } = new URL(request.url)
       if (pathname === '/jobs' && request.method === 'GET') {
         const courier = jobs.courierFor(deviceKey) ?? null
+        // Addresses are only for linked couriers. Unlinked devices just get their link status.
         return json({
-          jobs: jobs.listOpen(),
+          jobs: courier ? jobs.listOpen() : [],
           active: courier ? jobs.listActive(courier.id) : [],
           courier,
           linkPending: !courier && jobs.isLinkPending(deviceKey),
@@ -124,6 +154,11 @@ export function createApi({ jobs, telegram, botUsername, router, publicOrigin, d
       }
 
       if (pathname === '/couriers/link' && request.method === 'POST') {
+        const retryAfter = limitLinks(client.ip ?? 'unknown')
+        if (retryAfter !== undefined) {
+          headers.set('Retry-After', String(retryAfter))
+          throw new HttpError(429, 'Too many link requests. Try again shortly.')
+        }
         const link = jobs.createLink()
         if (!link) throw new HttpError(503, 'Too many pending links. Try again later.')
         return json({
@@ -144,13 +179,28 @@ export function createApi({ jobs, telegram, botUsername, router, publicOrigin, d
       const claimPath = /^\/jobs\/([a-z\d-]+)\/claim$/i.exec(pathname)
       if (claimPath && request.method === 'POST') {
         const courier = requireCourier()
-        const result = jobs.claim(claimPath[1], courier)
+        const telegramUserId = /^tg:(\d+)$/.exec(courier.id)?.[1]
+        // Cached for five minutes. Only a definite "not a member" blocks, not a Telegram outage.
+        if (telegram && groupId && telegramUserId
+          && await telegram.memberRole(groupId, Number(telegramUserId)) === 'none') {
+          throw new HttpError(403, 'This Telegram account is no longer in the dispatch group.')
+        }
+        const id = claimPath[1]
+        const pendingBefore = jobs.get(id)?.syncPending === true
+        const result = jobs.claim(id, courier)
         if (result.status === 'missing') throw new HttpError(404, 'Job not found.')
         if (result.status === 'conflict') throw new HttpError(409, 'Job already claimed.')
 
-        const telegramSynced = result.status === 'claimed' && result.card && telegram
-          ? await telegram.syncClaim(result.card, result.job)
-          : null
+        let telegramSynced: boolean | null = null
+        if (result.card && cards && telegram) {
+          if (result.status === 'claimed') {
+            const [edit, reply] = await Promise.all([cards.sync(id), telegram.sendClaimReply(result.card, result.job)])
+            telegramSynced = edit && reply
+          } else if (pendingBefore) {
+            // The owner asking again is a good moment to repair a card that fell behind.
+            telegramSynced = await cards.sync(id)
+          }
+        }
         return json({ job: result.job, telegramSynced } satisfies ClaimResponse)
       }
 
@@ -165,9 +215,10 @@ export function createApi({ jobs, telegram, botUsername, router, publicOrigin, d
         if (result.status === 'missing') throw new HttpError(404, 'Job not found.')
         if (result.status === 'forbidden') throw new HttpError(403, 'Only the courier who claimed this job can update it.')
         if (result.status === 'invalid') {
+          if (cards && jobs.get(result.job.id)?.syncPending) void cards.sync(result.job.id)
           return json({ error: `Job is already ${result.job.status}.`, job: result.job }, 409)
         }
-        const telegramSynced = result.card && telegram ? await telegram.syncCard(result.card, result.job) : null
+        const telegramSynced = result.card && cards ? await cards.sync(result.job.id) : null
         return json({ job: result.job, telegramSynced } satisfies StatusResponse)
       }
 

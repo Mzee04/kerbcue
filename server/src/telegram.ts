@@ -3,6 +3,7 @@ import { Agent, fetch } from 'undici'
 import { distanceLine, type AssignedJob, type Job, type OpenJob } from '../../shared/jobs.ts'
 import { courierNameOf, coordinatesOf, newJob, parseJob, type JobStore, type TelegramCard } from './jobs.ts'
 import type { Router } from './routing.ts'
+import { cardSyncFor } from './cardsync.ts'
 
 interface TelegramMessage {
   message_id: number
@@ -13,7 +14,7 @@ interface TelegramMessage {
   sender_chat?: { id: number }
   text?: string
   location?: { latitude: number; longitude: number }
-  reply_to_message?: { message_id: number }
+  reply_to_message?: { message_id: number; from?: { id?: number; is_bot?: boolean } }
 }
 
 interface TelegramUpdate {
@@ -175,19 +176,37 @@ export class TelegramClient {
     }
   }
 
-  async isGroupMember(chatId: string, userId: number): Promise<boolean> {
+  private readonly members = new Map<string, { role: MemberRole; until: number }>()
+
+  /**
+   * The user's role in a chat, cached for five minutes. Returns undefined when
+   * Telegram can't be reached, so callers can tell "unknown" from "not a member".
+   */
+  async memberRole(chatId: string, userId: number, now = Date.now()): Promise<MemberRole | undefined> {
+    const key = `${chatId}:${userId}`
+    const cached = this.members.get(key)
+    if (cached && cached.until > now) return cached.role
     try {
       const member = await this.call<{ status?: string; is_member?: boolean }>('getChatMember', { chat_id: chatId, user_id: userId })
-      return ['creator', 'administrator', 'member'].includes(member.status ?? '')
-        || (member.status === 'restricted' && member.is_member === true)
+      const role: MemberRole = member.status === 'creator' || member.status === 'administrator' ? 'admin'
+        : member.status === 'member' || (member.status === 'restricted' && member.is_member === true) ? 'member'
+          : 'none'
+      if (this.members.size > 5000) this.members.clear()
+      this.members.set(key, { role, until: now + 5 * 60_000 })
+      return role
     } catch (error) {
       reportTelegramFailure(error)
-      return false
+      return undefined
     }
   }
 
-  sendText(chatId: string | number, text: string, signal?: AbortSignal): Promise<TelegramMessage> {
-    return this.call('sendMessage', { chat_id: chatId, text }, signal)
+  async isGroupMember(chatId: string, userId: number): Promise<boolean> {
+    const role = await this.memberRole(chatId, userId)
+    return role === 'admin' || role === 'member'
+  }
+
+  sendText(chatId: string | number, text: string, signal?: AbortSignal, threadId?: number): Promise<TelegramMessage> {
+    return this.call('sendMessage', { chat_id: chatId, message_thread_id: threadId, text }, signal)
   }
 
   sendOpenCard(chatId: string, job: OpenJob, threadId?: number, signal?: AbortSignal): Promise<TelegramMessage> {
@@ -242,9 +261,33 @@ export class TelegramClient {
 
   /** Status changes and new pins edit the original card in place. No new group messages. */
   async syncCard(card: TelegramCard, job: Job): Promise<boolean> {
-    return await this.editCard(card, job).catch(reportTelegramFailure) !== null
+    return await this.renderCard(card, job) === 'ok'
+  }
+
+  /** Edits the card and says whether a failure is worth retrying later. */
+  async renderCard(card: TelegramCard, job: Job): Promise<'ok' | 'retry' | 'permanent'> {
+    try {
+      await this.editCard(card, job)
+      return 'ok'
+    } catch (error) {
+      reportTelegramFailure(error)
+      const status = error instanceof TelegramError ? error.rejection?.status : undefined
+      // Network errors, rate limits and server errors can clear up. A deleted card or a removed bot won't.
+      return status === undefined || status === 429 || status >= 500 ? 'retry' : 'permanent'
+    }
+  }
+
+  async sendClaimReply(card: TelegramCard, job: AssignedJob): Promise<boolean> {
+    return await this.notify('sendMessage', {
+      chat_id: card.telegramChatId,
+      message_thread_id: card.telegramThreadId,
+      reply_parameters: { message_id: card.telegramMessageId, allow_sending_without_reply: true },
+      text: `${job.courierName} claimed the delivery.`,
+    }).catch(reportTelegramFailure) !== null
   }
 }
+
+export type MemberRole = 'admin' | 'member' | 'none'
 
 function reportTelegramFailure(error: unknown): null {
   console.error(error instanceof TelegramError ? error.message : 'Telegram update failed.')
@@ -264,9 +307,18 @@ async function linkCourier(
   message: TelegramMessage,
   signal?: AbortSignal,
 ): Promise<void> {
-  const match = /^\/start(?:@[a-z\d_]+)?(?:\s+([A-Za-z\d]{4,16}))?\s*$/i.exec(message.text?.trim() ?? '')
-  if (!match || !message.from?.id || message.from.is_bot) return
+  const text = message.text?.trim() ?? ''
+  if (!message.from?.id || message.from.is_bot) return
   const reply = (text: string) => telegram.sendText(message.chat.id, text, signal).catch(reportTelegramFailure)
+  if (/^\/unlink(?:@[a-z\d_]+)?\s*$/i.test(text)) {
+    const removed = jobs.unlinkCourier(`tg:${message.from.id}`)
+    await reply(removed > 0
+      ? `Unlinked ${removed} ${removed === 1 ? 'device' : 'devices'}. Reopen Kerbcue on your glasses to link again.`
+      : 'No Kerbcue glasses are linked to your account.')
+    return
+  }
+  const match = /^\/start(?:@[a-z\d_]+)?(?:\s+([A-Za-z\d]{4,16}))?\s*$/i.exec(text)
+  if (!match) return
   if (!match[1]) {
     await reply('Open Kerbcue on your glasses. It shows a link code. Send /start CODE here to link them.')
     return
@@ -283,13 +335,47 @@ async function linkCourier(
 }
 
 async function routeAndSync(telegram: TelegramClient, jobs: JobStore, id: string, router?: Router): Promise<void> {
-  let stored = jobs.get(id)
-  const job = stored?.job
+  const job = jobs.get(id)?.job
   if (router && job?.pickupAt && job.dropAt && !job.route) {
     const route = await router(job.pickupAt, job.dropAt)
-    if (route) stored = jobs.setRoute(id, route) ?? stored
+    if (route) jobs.setRoute(id, route)
   }
-  if (stored?.card) await telegram.syncCard(stored.card, stored.job)
+  await cardSyncFor(telegram, jobs).sync(id)
+}
+
+/**
+ * `/unlink <name, @username or Telegram user ID>` in the group, or `/unlink` as a reply
+ * to the courier's message. Only listed dispatchers or group admins can use it.
+ */
+async function unlinkFromGroup(
+  telegram: TelegramClient,
+  jobs: JobStore,
+  message: TelegramMessage,
+  isAnonymousAdmin: boolean,
+  dispatcherIds: ReadonlySet<string> | undefined,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const match = /^\/unlink(?:@[a-z\d_]+)?(?:\s+(.{1,64}))?$/i.exec(message.text?.trim() ?? '')
+  if (!match) return false
+  const chatId = String(message.chat.id)
+  const threadId = message.is_topic_message ? message.message_thread_id : undefined
+  const reply = (text: string) => telegram.sendText(chatId, text, signal, threadId).catch(reportTelegramFailure)
+  const senderId = message.from?.id
+  const allowed = isAnonymousAdmin || (senderId !== undefined && (dispatcherIds
+    ? dispatcherIds.has(String(senderId))
+    : await telegram.memberRole(chatId, senderId) === 'admin'))
+  if (!allowed) return true
+
+  const repliedTo = message.reply_to_message?.from
+  const courier = match[1] ? jobs.findCourier(match[1])
+    : repliedTo?.id && !repliedTo.is_bot ? jobs.findCourier(String(repliedTo.id)) : undefined
+  if (!courier) {
+    await reply('No linked courier matches. Use /unlink <name or Telegram user ID>, or reply /unlink to their message.')
+    return true
+  }
+  const removed = jobs.unlinkCourier(courier.id)
+  await reply(`Unlinked ${courier.name} from ${removed} ${removed === 1 ? 'device' : 'devices'}.`)
+  return true
 }
 
 export interface IngestOptions {
@@ -320,6 +406,7 @@ export async function ingestUpdate(
   }
   const isAnonymousAdmin = message.sender_chat?.id === message.chat.id
   if (chatId !== groupId || (message.from?.is_bot && !isAnonymousAdmin)) return
+  if (await unlinkFromGroup(telegram, jobs, message, isAnonymousAdmin, dispatcherIds, signal)) return
   const requireDispatcher = dispatcherIds !== undefined && !isAnonymousAdmin
   if (requireDispatcher && !dispatcherIds.has(String(message.from?.id))) return
 

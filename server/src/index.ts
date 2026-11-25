@@ -2,7 +2,8 @@ import { createServer } from 'node:http'
 import { Readable } from 'node:stream'
 import { createApi } from './api.ts'
 import { JobStore } from './jobs.ts'
-import { createOsrmRouter } from './routing.ts'
+import { cardSyncFor } from './cardsync.ts'
+import { createOsrmRouter, routingLabel } from './routing.ts'
 import { pollTelegram, TelegramClient } from './telegram.ts'
 
 const port = Number(process.env.PORT?.trim() || '8787')
@@ -26,8 +27,7 @@ const routingUrl = process.env.KERBCUE_ROUTING_URL?.trim() || undefined
 if (routingUrl && !/^https?:\/\/[^\s?#]+$/.test(routingUrl)) {
   throw new Error('KERBCUE_ROUTING_URL must be an http(s) base URL of an OSRM-compatible server.')
 }
-const routingProfile = process.env.KERBCUE_ROUTING_PROFILE?.trim() || 'road'
-if (!/^[a-z]{1,12}$/i.test(routingProfile)) throw new Error('KERBCUE_ROUTING_PROFILE must be one short word, such as bike.')
+const routingProfile = routingUrl ? routingLabel(routingUrl, process.env.KERBCUE_ROUTING_PROFILE) : 'road'
 const router = routingUrl ? createOsrmRouter(routingUrl, routingProfile) : undefined
 
 const telegram = token ? new TelegramClient(token) : undefined
@@ -39,6 +39,7 @@ const api = createApi({
   telegram,
   botUsername,
   router,
+  groupId,
   publicOrigin: process.env.PUBLIC_ORIGIN?.trim() || '*',
   demo,
 })
@@ -56,7 +57,7 @@ const server = createServer(async (incoming, outgoing) => {
       init.duplex = 'half'
     }
     const request = new Request(new URL(incoming.url ?? '/', 'http://localhost'), init)
-    const response = await api(request)
+    const response = await api(request, { ip: incoming.socket.remoteAddress })
     outgoing.writeHead(response.status, Object.fromEntries(response.headers))
     outgoing.end(response.body ? Buffer.from(await response.arrayBuffer()) : undefined)
   } catch {
@@ -76,12 +77,16 @@ server.listen(port, '0.0.0.0', () => {
   if (telegram) {
     console.log(groupId ? 'Telegram polling enabled.' : 'Telegram polling for group chat ID discovery.')
     void pollTelegram(telegram, jobs, groupId, stop.signal, dispatcherIds, router)
+    // Retries card edits that failed earlier, including ones saved before a restart.
+    cardSyncFor(telegram, jobs).start(stop.signal)
     if (!groupId) console.log('Courier linking stays off until TELEGRAM_GROUP_CHAT_ID is set.')
   } else if (demo) {
     console.log('Demo mode: POST /jobs adds jobs and POST /couriers/demo-link links a courier.')
   }
   console.log(router ? `Route estimates enabled (${routingProfile}).` : 'Route estimates off. Cards show straight-line distance.')
 })
+
+setInterval(() => jobs.purgeExpiredLinks(), 60_000).unref()
 
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.once(signal, () => {

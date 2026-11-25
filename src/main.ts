@@ -18,6 +18,7 @@ import {
   type RouteEstimate,
 } from '../shared/jobs.ts'
 import { createJobsClient } from './api.ts'
+import { deliveryConfirmMs, deliveryTap, isConfirming, type PendingConfirm } from './confirm.ts'
 
 const mainContainer = { containerID: 1, containerName: 'main' }
 const displayReloadKey = 'kerbcue-display-reload'
@@ -157,6 +158,7 @@ async function start(): Promise<void> {
   let busy: Action | undefined
   let confirmation: { text: string; until: number } | undefined
   let notice: { text: string; until: number } | undefined
+  let confirmDelivery: PendingConfirm | undefined
   let painting = false
   let refreshVersion = 0
   let refreshing = false
@@ -185,7 +187,8 @@ async function start(): Promise<void> {
       const to = nextStatus[current.status]
       const state = current.status === 'claimed' ? `Claimed by ${shorten(current.courierName, 18)}` : 'Picked up'
       const hint = busy ? 'Saving...'
-        : message ?? (offline ? 'Offline. Retrying...' : to === 'picked_up' ? 'Tap: mark picked up' : 'Tap: mark delivered')
+        : isConfirming(confirmDelivery, current.id, now) ? 'Tap again to confirm delivered'
+          : message ?? (offline ? 'Offline. Retrying...' : to === 'picked_up' ? 'Tap: mark picked up' : 'Tap: mark delivered')
       return {
         action: busy || !to ? undefined : { kind: 'advance', job: current, to },
         text: ['Kerbcue  My job', ...deliveryLines(current), '', state, hint].join('\n'),
@@ -303,6 +306,7 @@ async function start(): Promise<void> {
       index = (index + direction + jobs.length) % jobs.length
     }
     notice = undefined
+    confirmDelivery = undefined
     void paint()
   }
 
@@ -350,6 +354,16 @@ async function start(): Promise<void> {
   async function act(): Promise<void> {
     const action = displayed?.action
     if (!api || stopped() || busy || !action) return
+    if (action.kind === 'advance' && action.to === 'delivered') {
+      const tap = deliveryTap(confirmDelivery, action.job.id, Date.now())
+      confirmDelivery = tap.pending
+      if (!tap.send) {
+        void paint()
+        // Drop the prompt when it times out.
+        window.setTimeout(() => void paint(), deliveryConfirmMs + 100)
+        return
+      }
+    }
     busy = action
     notice = undefined
     void paint()

@@ -179,9 +179,9 @@ test('treats "message is not modified" as an up-to-date card', async t => {
 })
 
 test('parses coordinates, shows labelled straight-line distance, and omits it when coordinates are missing', () => {
-  const parsed = parseJob('/job pickup: Central Station @ 6.4541, 3.3947 | drop: 42 Market Street @6.4281,3.4219 | pay: 15 USD')
+  const parsed = parseJob('/job pickup: Central Station @ 40.0000, 10.0000 | drop: 42 Market Street @40.0150,10.0200 | pay: 15 USD')
   assert.deepEqual(parsed, {
-    ...details, pickupAt: { lat: 6.4541, lng: 3.3947 }, dropAt: { lat: 6.4281, lng: 3.4219 },
+    ...details, pickupAt: { lat: 40, lng: 10 }, dropAt: { lat: 40.0150, lng: 10.0200 },
   })
   assert.ok(parsed)
   assert.match(distanceLine(parsed) ?? '', /^\d+\.\d km straight-line$/)
@@ -192,7 +192,7 @@ test('parses coordinates, shows labelled straight-line distance, and omits it wh
   const noCoords = parseJob('/job pickup: Central Station | drop: 42 Market Street | pay: 15 USD')
   assert.ok(noCoords)
   assert.equal(distanceLine(noCoords), undefined)
-  const onlyPickup = parseJob('/job pickup: Central Station @ 6.4541, 3.3947 | drop: 42 Market Street | pay: 15 USD')
+  const onlyPickup = parseJob('/job pickup: Central Station @ 40.0000, 10.0000 | drop: 42 Market Street | pay: 15 USD')
   assert.ok(onlyPickup)
   assert.equal(distanceLine(onlyPickup), undefined)
   assert.doesNotMatch(cardText(newJob(onlyPickup)), /Distance/)
@@ -202,11 +202,11 @@ test('parses coordinates, shows labelled straight-line distance, and omits it wh
 
 test('uses a route estimate when the router answers and falls back to straight-line when it fails', async () => {
   const routed = createOsrmRouter('https://router.example/', 'bike', async input => {
-    assert.equal(String(input), 'https://router.example/route/v1/driving/3.3947,6.4541;3.4219,6.4281?overview=false')
+    assert.equal(String(input), 'https://router.example/route/v1/driving/10,40;10.02,40.015?overview=false')
     return Response.json({ code: 'Ok', routes: [{ distance: 6920.9, duration: 1721.2 }] })
   })
-  const from = { lat: 6.4541, lng: 3.3947 }
-  const to = { lat: 6.4281, lng: 3.4219 }
+  const from = { lat: 40, lng: 10 }
+  const to = { lat: 40.0150, lng: 10.0200 }
   const route = await routed(from, to)
   assert.deepEqual(route, { km: 6.9, minutes: 29, profile: 'bike' })
   assert.equal(distanceLine({ ...details, pickupAt: from, dropAt: to, route }), '6.9 km bike route, ~29 min')
@@ -243,9 +243,9 @@ test('dispatcher location pins replying to a card set pickup then drop and edit 
         return Response.json({ ok: true, result: [
           { update_id: 1, message: { chat: { id: Number(groupId), type: 'supergroup' }, message_id: 5, from: { id: 7 },
             text: '/job pickup: Central Station | drop: 42 Market Street | pay: 15 USD' } },
-          pin(2, 6.4541, 3.3947, 99),
-          pin(3, 6.4541, 3.3947),
-          pin(4, 6.4281, 3.4219),
+          pin(2, 40.0000, 10.0000, 99),
+          pin(3, 40.0000, 10.0000),
+          pin(4, 40.0150, 10.0200),
           pin(5, 1, 1),
         ] })
       }
@@ -258,8 +258,8 @@ test('dispatcher location pins replying to a card set pickup then drop and edit 
   await pollTelegram(telegram, jobs, groupId, stop.signal, new Set(['7']), router)
 
   const [job] = jobs.listOpen()
-  assert.deepEqual(job.pickupAt, { lat: 6.4541, lng: 3.3947 })
-  assert.deepEqual(job.dropAt, { lat: 6.4281, lng: 3.4219 })
+  assert.deepEqual(job.pickupAt, { lat: 40, lng: 10 })
+  assert.deepEqual(job.dropAt, { lat: 40.0150, lng: 10.0200 })
   const edits = calls.filter(call => call.method === 'editMessageText')
   assert.equal(edits.length, 2)
   assert.doesNotMatch(String(edits[0].body.text), /Distance/)
@@ -332,7 +332,7 @@ test('persists linked couriers and delivery history across restarts, and loads o
   const dataFile = join(directory, 'kerbcue.json')
   const first = new JobStore(dataFile)
   const key = linkDevice(first, alex)
-  const job = newJob({ ...details, pickupAt: { lat: 6.4541, lng: 3.3947 } })
+  const job = newJob({ ...details, pickupAt: { lat: 40, lng: 10 } })
   first.add(job, card)
   assert.equal(first.claim(job.id, alex).status, 'claimed')
   assert.equal(first.advance(job.id, alex.id, 'picked_up').status, 'advanced')
@@ -341,7 +341,7 @@ test('persists linked couriers and delivery history across restarts, and loads o
   assert.deepEqual(restarted.courierFor(key), alex)
   const [active] = restarted.listActive(alex.id)
   assert.equal(active.status, 'picked_up')
-  assert.deepEqual(active.pickupAt, { lat: 6.4541, lng: 3.3947 })
+  assert.deepEqual(active.pickupAt, { lat: 40, lng: 10 })
   assert.equal(restarted.advance(job.id, bola.id, 'delivered').status, 'forbidden')
   assert.equal(restarted.advance(job.id, alex.id, 'delivered').status, 'advanced')
   assert.equal(new JobStore(dataFile).get(job.id)?.job.status, 'delivered')

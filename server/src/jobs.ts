@@ -19,7 +19,8 @@ export interface TelegramCard {
   telegramThreadId?: number
 }
 
-type StoredJob = { job: Job; card?: TelegramCard }
+/** `syncPending` marks a job whose latest state is not yet on its Telegram card. */
+export type StoredJob = { job: Job; card?: TelegramCard; syncPending?: boolean }
 type StoredDevice = { keyHash: string; courierId: string }
 const jobCommand = /^\/job(?:@[a-z\d_]+)?\s+/i
 const coordinateSuffix = /\s*@\s*(-?\d{1,3}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)\s*$/
@@ -45,7 +46,7 @@ export function coordinatesOf(value: unknown): Coordinates | undefined {
   return { lat: Math.round(lat * 1e6) / 1e6, lng: Math.round(lng * 1e6) / 1e6 }
 }
 
-/** Splits "Central Station @ 6.4541, 3.3947" into a place name and coordinates. */
+/** Splits "Central Station @ 40.0000, 10.0000" into a place name and coordinates. */
 function placeOf(value: unknown): { name?: string; at?: Coordinates; invalid?: true } {
   if (typeof value !== 'string') return {}
   const match = coordinateSuffix.exec(value)
@@ -116,6 +117,7 @@ function storedJobOf(value: unknown): StoredJob | undefined {
   if (!isRecord(value) || !isRecord(value.job)) return undefined
   const { job, card } = value
   if (typeof job.id !== 'string' || !job.id || !jobDetailsOf(job) || !isRoute(job.route)) return undefined
+  if (value.syncPending !== undefined && typeof value.syncPending !== 'boolean') return undefined
   if (card !== undefined && !(isRecord(card)
     && typeof card.telegramChatId === 'string'
     && Number.isSafeInteger(card.telegramMessageId)
@@ -127,7 +129,11 @@ function storedJobOf(value: unknown): StoredJob | undefined {
   if (job.status === 'delivered' && !isTime(job.deliveredAt)) return undefined
   // Data files from before Telegram identity stored only a courier name.
   const courierId = typeof job.courierId === 'string' && job.courierId ? job.courierId : `name:${job.courierName}`
-  return { job: { ...job, courierId } as AssignedJob, card: card as TelegramCard | undefined }
+  return {
+    job: { ...job, courierId } as AssignedJob,
+    card: card as TelegramCard | undefined,
+    ...(value.syncPending ? { syncPending: true } : {}),
+  }
 }
 
 function isCourier(value: unknown): value is Courier {
@@ -189,7 +195,14 @@ export class JobStore {
         telegramOffset: saved.telegramOffset,
       }
     } catch {
-      console.warn('Kerbcue job data is corrupt. Starting with an empty job store.')
+      // Keep the bad file for inspection instead of overwriting it on the next save.
+      const kept = `${dataFile}.corrupt-${new Date().toISOString().replace(/[:.]/g, '-')}`
+      try {
+        renameSync(dataFile, kept)
+        console.warn(`Kerbcue job data is corrupt. Moved it to ${kept} and started with an empty job store.`)
+      } catch {
+        console.warn('Kerbcue job data is corrupt and could not be moved. Starting with an empty job store.')
+      }
     }
   }
 
@@ -250,10 +263,24 @@ export class JobStore {
   // Courier identity -------------------------------------------------------
 
   /** Starts a link for a new device. Only a hash of the device key is kept. */
-  createLink(now = Date.now()) {
+  /** Drops expired link codes. Runs on every link call and on a timer. */
+  purgeExpiredLinks(now = Date.now()): number {
+    let removed = 0
     for (const [code, pending] of this.pendingLinks) {
-      if (pending.expiresAt <= now) this.pendingLinks.delete(code)
+      if (pending.expiresAt <= now) {
+        this.pendingLinks.delete(code)
+        removed += 1
+      }
     }
+    return removed
+  }
+
+  pendingLinkCount(): number {
+    return this.pendingLinks.size
+  }
+
+  createLink(now = Date.now()) {
+    this.purgeExpiredLinks(now)
     if (this.pendingLinks.size >= maxPendingLinks) return undefined
     let code = newLinkCode()
     while (this.pendingLinks.has(code)) code = newLinkCode()
@@ -278,6 +305,21 @@ export class JobStore {
     this.commit({ ...this.state, couriers, devices })
     this.pendingLinks.delete(key)
     return 'linked'
+  }
+
+  /** Removes every device linked to a courier. Their jobs keep the name for history. */
+  unlinkCourier(courierId: string): number {
+    const devices = new Map([...this.state.devices].filter(([, id]) => id !== courierId))
+    const removed = this.state.devices.size - devices.size
+    if (removed > 0) this.commit({ ...this.state, devices })
+    return removed
+  }
+
+  findCourier(query: string): Courier | undefined {
+    const wanted = query.trim().replace(/^@/, '').toLowerCase()
+    const couriers = [...this.state.couriers.values()]
+    return couriers.find(courier => courier.id === `tg:${wanted}`)
+      ?? couriers.find(courier => courier.name.toLowerCase() === wanted || courier.name.toLowerCase() === `@${wanted}`)
   }
 
   courierFor(deviceKey: string | undefined): Courier | undefined {
@@ -312,7 +354,7 @@ export class JobStore {
       claimedAt: new Date().toISOString(),
     }
     // Reserve the job synchronously, before the HTTP handler awaits Telegram.
-    this.storeJob({ ...stored, job })
+    this.storeJob({ ...stored, job, syncPending: !!stored.card })
     return { status: 'claimed', job, card: stored.card } as const
   }
 
@@ -328,7 +370,7 @@ export class JobStore {
     const next: AssignedJob = to === 'picked_up'
       ? { ...job, status: 'picked_up', pickedUpAt: at }
       : { ...job, status: 'delivered', deliveredAt: at }
-    this.storeJob({ ...stored, job: next })
+    this.storeJob({ ...stored, job: next, syncPending: !!stored.card })
     return { status: 'advanced', job: next, card: stored.card } as const
   }
 
@@ -345,7 +387,7 @@ export class JobStore {
     if (!stored || stored.job.status === 'delivered') return undefined
     const field = !stored.job.pickupAt ? 'pickupAt' : !stored.job.dropAt ? 'dropAt' : undefined
     if (!field) return undefined
-    const next = { ...stored, job: { ...stored.job, [field]: at } as Job }
+    const next = { ...stored, job: { ...stored.job, [field]: at } as Job, syncPending: !!stored.card }
     this.storeJob(next)
     return next
   }
@@ -353,8 +395,22 @@ export class JobStore {
   setRoute(id: string, route: RouteEstimate): StoredJob | undefined {
     const stored = this.state.jobs.get(id)
     if (!stored) return undefined
-    const next = { ...stored, job: { ...stored.job, route } as Job }
+    const next = { ...stored, job: { ...stored.job, route } as Job, syncPending: !!stored.card }
     this.storeJob(next)
     return next
+  }
+
+  // Telegram card sync -----------------------------------------------------
+
+  pendingSyncIds(): string[] {
+    return [...this.state.jobs.values()].flatMap(stored => stored.syncPending && stored.card ? [stored.job.id] : [])
+  }
+
+  /** Clears the marker only if `job` is still the latest state, so a newer change stays pending. */
+  markSynced(id: string, job: Job): boolean {
+    const stored = this.state.jobs.get(id)
+    if (!stored || stored.job !== job) return false
+    if (stored.syncPending) this.storeJob({ ...stored, syncPending: false })
+    return true
   }
 }

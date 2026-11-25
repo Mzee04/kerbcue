@@ -135,7 +135,9 @@ test('polls only the configured group and replies to the canonical Telegram card
   await pollTelegram(telegram, jobs, groupId, stop.signal)
   assert.deepEqual(calls.map(({ method }) => method), ['getUpdates', 'sendMessage', 'getUpdates'])
   assert.deepEqual(calls[2].body, { offset: 103, timeout: 25, allowed_updates: ['message'] })
-  const listed = await api(request('/jobs'))
+  const alexKey = linkDevice(jobs, alex)
+  const bolaKey = linkDevice(jobs, bola)
+  const listed = await api(request('/jobs', undefined, alexKey))
   assert.equal(listed.status, 200)
   const open = await listed.json() as OpenJobsResponse
   assert.equal(open.jobs.length, 1)
@@ -148,13 +150,11 @@ test('polls only the configured group and replies to the canonical Telegram card
   assert.equal((await api(request('/jobs', {}))).status, 404)
 
   const claimPath = `/jobs/${job.id}/claim`
-  const alexKey = linkDevice(jobs, alex)
-  const bolaKey = linkDevice(jobs, bola)
   const first = api(request(claimPath, {}, alexKey))
   try {
     await Promise.all([editStarted.promise, replyStarted.promise])
     assert.equal((await api(request(claimPath, {}, bolaKey))).status, 409)
-    assert.deepEqual((await (await api(request('/jobs'))).json()).jobs, [])
+    assert.deepEqual((await (await api(request('/jobs', undefined, bolaKey))).json()).jobs, [])
   } finally {
     finishEdit.resolve()
   }

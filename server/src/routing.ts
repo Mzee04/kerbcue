@@ -36,3 +36,26 @@ export function createOsrmRouter(
     }
   }
 }
+
+const knownServers: [RegExp, string][] = [
+  [/^https?:\/\/routing\.openstreetmap\.de\/routed-bike\/?$/i, 'bike'],
+  [/^https?:\/\/routing\.openstreetmap\.de\/routed-foot\/?$/i, 'foot'],
+  [/^https?:\/\/routing\.openstreetmap\.de\/routed-car\/?$/i, 'car'],
+  [/^https?:\/\/router\.project-osrm\.org\/?$/i, 'car'],
+]
+
+/**
+ * The label shown next to route estimates. An OSRM server routes with the one
+ * profile it was built with and ignores the profile name in the request path,
+ * so the label must come from the server, not from what we ask for. Known
+ * public servers get their real mode, and a conflicting setting is an error.
+ */
+export function routingLabel(baseUrl: string, configured?: string): string {
+  const known = knownServers.find(([pattern]) => pattern.test(baseUrl))?.[1]
+  const wanted = configured?.trim().toLowerCase() || undefined
+  if (wanted && !/^[a-z]{1,12}$/.test(wanted)) throw new Error('KERBCUE_ROUTING_PROFILE must be one short word, such as bike.')
+  if (known && wanted && wanted !== known) {
+    throw new Error(`KERBCUE_ROUTING_PROFILE=${wanted} does not match ${baseUrl}, which routes for ${known}.`)
+  }
+  return known ?? wanted ?? 'road'
+}
